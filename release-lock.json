@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "product": "OpWeave",
+  "package_name": "com.opweave.workflow",
+  "package_path": "Packages/com.opweave.workflow",
+  "version": "0.1.0",
+  "intended_git_tag": "v0.1.0",
+  "source_repository": "pippirium/OpWeave-dev",
+  "source_commit": "8f3e0073af8129d37873c0bfe300d738b0ba5dcf",
+  "source_package_manifest_blob_sha": "864b7a817ac8b0912b5b3278a8dd6faf69cc9632",
+  "verified_release_candidate_commit": "152698b3b680af1ffdd26355d8c47769cd7d09ee",
+  "verified_release_candidate_tree": "97fe93bc246a6c095e3656aded0534942aceb925",
+  "approved_merge_result_tree": "4c3fc90e2e50d627d216b5db3cfd0a9d972d74cb",
+  "target_platform": "Windows 11 x64",
+  "verified_unity_editor": "6000.5.11f1",
+  "release_evidence": "https://github.com/pippirium/OpWeave-dev/issues/522#issuecomment-7087622052",
+  "public_repository": "pippirium/OpWeave"
+}

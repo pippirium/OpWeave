@@ -2,13 +2,13 @@
 
 [日本語](README.ja.md)
 
-OpWeave is a planned workflow tool for discovering, connecting, and executing typed operations in the Unity Editor. It aims to let people and AI agents compose repeatable editing tasks while validating their inputs, execution order, and completion conditions.
+OpWeave is a Unity Editor workflow tool for discovering, connecting, and executing typed operations. Windows v1 has completed development acceptance; public package distribution is being prepared.
 
 ## Status
 
-**OpWeave is in the planning and early development stage.** There is no released package or supported installation procedure yet. The features described below are goals, not implemented functionality.
+**Windows v1 development is complete and verified, but this public repository does not yet contain the distributable Unity package.** The agreed version is **0.1.0**, recorded in [VERSION](VERSION) and [release-lock.json](release-lock.json). No public release tag or supported installation procedure exists yet.
 
-## Planned capabilities
+## Windows v1 capabilities (verified development build)
 
 - Search an operation catalog by type, compatibility, and side effects.
 - Build workflows with a visual node editor and separate control and data connections.
@@ -20,6 +20,6 @@ The initial scope is Unity Editor editing operations. Runtime visual scripting, 
 
 ## Releases and development
 
-This repository is intended for release updates. No releases are available yet. Development and design work take place in [OpWeave-dev](https://github.com/pippirium/OpWeave-dev).
+This repository is the intended public distribution destination. The Windows v1 development baseline is version **0.1.0** (`com.opweave.workflow`), mapped to the verified source commit in [release-lock.json](release-lock.json). The development repository is [OpWeave-dev](https://github.com/pippirium/OpWeave-dev) (private; not available to all visitors).
 
-Supported Unity versions, installation instructions, distribution details, and licensing have not yet been decided.
+**Verified development target:** Windows 11 x64, Unity 6000.5.11f1. The public package, installation URL, release tag `v0.1.0`, and distribution/license notices are **not published yet**. The version record is not a release announcement; publication requires an audited transfer of the product package and a separate release decision.
