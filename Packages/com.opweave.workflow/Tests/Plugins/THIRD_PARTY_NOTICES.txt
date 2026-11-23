@@ -1,0 +1,88 @@
+Third-party binary notices — Packages/com.opweave.workflow/Tests/Plugins/
+============================================================================
+
+The nine DLLs in this directory are vendored NuGet package binaries used
+only by test assemblies (see each DLL's .meta constraints). They are not
+OpWeave product code. Each entry records the source package, the license
+under which the binary is distributed, its copyright notice, and the
+SHA-256 of the committed file. Every committed DLL was verified
+byte-identical (SHA-256) to the stated file inside the official
+nuget.org .nupkg of the stated version (independent verification
+2026-11-22, Issue #76; the .nupkg payloads were fetched from the NuGet
+v3 flat container).
+
+Humanizer.dll
+  Package: Humanizer.Core 2.14.1 (https://www.nuget.org/packages/Humanizer.Core/2.14.1)
+  License: MIT
+  nupkg member: lib/netstandard2.0/Humanizer.dll
+  SHA-256: 2c522cd285de2e3a02520f91203f548e454b980821f10df90e801bd7d3f5c43e
+  Copyright: .NET Foundation and Contributors
+
+Json.More.dll
+  Package: Json.More.Net 2.1.1 (https://www.nuget.org/packages/Json.More.Net/2.1.1)
+  License: MIT
+  nupkg member: lib/netstandard2.0/Json.More.dll
+  SHA-256: 5fc34ad457232583c0ee90c18c419ff00a96403faf7e624fd046985ba37ec3cd
+  Copyright: .NET Foundation and Contributors
+
+JsonPointer.Net.dll
+  Package: JsonPointer.Net 5.3.1 (https://www.nuget.org/packages/JsonPointer.Net/5.3.1)
+  License: MIT
+  nupkg member: lib/netstandard2.0/JsonPointer.Net.dll
+  SHA-256: e247db13aed64d75c99e7fdbdf003e12acdebb9126115ec965a1c55562db00bd
+  Copyright: .NET Foundation and Contributors
+
+JsonSchema.Net.dll
+  Package: JsonSchema.Net 7.4.0 (https://www.nuget.org/packages/JsonSchema.Net/7.4.0)
+  License: MIT
+  nupkg member: lib/netstandard2.0/JsonSchema.Net.dll
+  SHA-256: 626ebc11fa57a6ef5e0a399c0592f54373540e32354b4ead1aaa3ea5d6bab094
+  Copyright: .NET Foundation and Contributors
+
+Microsoft.Bcl.AsyncInterfaces.dll
+  Package: Microsoft.Bcl.AsyncInterfaces 9.0.0 (https://www.nuget.org/packages/Microsoft.Bcl.AsyncInterfaces/9.0.0)
+  License: MIT
+  nupkg member: lib/netstandard2.1/Microsoft.Bcl.AsyncInterfaces.dll
+  SHA-256: d263b9cb7553c9f750ac51f3011deeb644e47bd6deffc027aa1f9a6492f75c54
+  Copyright: .NET Foundation and Contributors
+
+System.IO.Pipelines.dll
+  Package: System.IO.Pipelines 9.0.0 (https://www.nuget.org/packages/System.IO.Pipelines/9.0.0)
+  License: MIT
+  nupkg member: lib/netstandard2.0/System.IO.Pipelines.dll
+  SHA-256: 3c3379b3c25c99c6d05aecf851deb22d7ff2eed6d033b9cf7f73bb6dfa7e0c68
+  Copyright: .NET Foundation and Contributors
+
+System.Runtime.CompilerServices.Unsafe.dll
+  Package: System.Runtime.CompilerServices.Unsafe 6.1.2 (https://www.nuget.org/packages/System.Runtime.CompilerServices.Unsafe/6.1.2)
+  License: MIT
+  nupkg member: lib/netstandard2.0/System.Runtime.CompilerServices.Unsafe.dll
+  SHA-256: fd67abc4c4af10affbcd42fd68a2a7bc361b26714afe6965d4d0d139459d8297
+  Copyright: .NET Foundation and Contributors
+
+System.Text.Encodings.Web.dll
+  Package: System.Text.Encodings.Web 9.0.0 (https://www.nuget.org/packages/System.Text.Encodings.Web/9.0.0)
+  License: MIT
+  nupkg member: lib/netstandard2.0/System.Text.Encodings.Web.dll
+  SHA-256: 3e195a2e41d9ad55c02b54178cfe4f8693a5805eefd151d418cff4a1ac2d81ae
+  Copyright: .NET Foundation and Contributors
+
+System.Text.Json.dll
+  Package: System.Text.Json 9.0.0 (https://www.nuget.org/packages/System.Text.Json/9.0.0)
+  License: MIT
+  nupkg member: lib/netstandard2.0/System.Text.Json.dll
+  SHA-256: facd66d4de5042b32e0df1af6a092cfbeefd1210ae4df96cb7e96628ca36dcb9
+  Copyright: .NET Foundation and Contributors
+
+Copyright holders of record (package .nuspec/assembly metadata):
+  - Humanizer.Core: authors Mehdi Khalili, Claire Novotny; copyright
+    (c) .NET Foundation and Contributors; license MIT (expression).
+  - Json.More.Net / JsonPointer.Net / JsonSchema.Net (json-everything):
+    author Greg Dennis; bundled LICENSE is MIT, copyright (c) .NET
+    Foundation and Contributors.
+  - Microsoft.* / System.* packages: copyright (c) Microsoft
+    Corporation, licensed MIT; bundled LICENSE.TXT copyright (c) .NET
+    Foundation and Contributors; the .NET runtime THIRD-PARTY-NOTICES.TXT
+    is reproduced in Licenses/dotnet-THIRD-PARTY-NOTICES.txt.
+
+License texts are reproduced verbatim in Licenses/ next to this file.

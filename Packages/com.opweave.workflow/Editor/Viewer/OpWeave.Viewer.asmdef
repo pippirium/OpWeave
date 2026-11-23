@@ -1,0 +1,21 @@
+{
+    "name": "OpWeave.Viewer",
+    "rootNamespace": "OpWeave.Viewer",
+    "references": [
+        "OpWeave.Core",
+        "OpWeave.UnityAdapter"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

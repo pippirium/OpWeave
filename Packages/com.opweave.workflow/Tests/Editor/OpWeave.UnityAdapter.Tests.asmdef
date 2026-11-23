@@ -1,0 +1,31 @@
+{
+    "name": "OpWeave.UnityAdapter.Tests",
+    "rootNamespace": "OpWeave.UnityAdapter.Tests",
+    "references": [
+        "OpWeave.AgentApi",
+        "OpWeave.Core",
+        "OpWeave.GraphToolkit",
+        "OpWeave.Operations",
+        "OpWeave.UnityAdapter",
+        "OpWeave.Testing",
+        "OpWeave.Viewer",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll",
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

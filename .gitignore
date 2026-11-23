@@ -1,0 +1,18 @@
+# Unity-generated directories (for anyone opening this repository inside a project)
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]serSettings/
+MemoryCaptures/
+crashlytics-build.properties
+
+# IDE / OS noise
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.user
+Thumbs.db
+.DS_Store
