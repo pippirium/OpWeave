@@ -1,0 +1,15 @@
+OpWeave (com.opweave.workflow)
+Copyright 2026 pippirium and OpWeave contributors.
+
+Original OpWeave project materials are made available under the
+Apache License, Version 2.0. See LICENSE (repository root) or
+Packages/com.opweave.workflow/LICENSE.md (UPM package).
+
+Third-party components, including the vendored test-only DLLs, retain
+their separate licenses and attribution notices. See
+Packages/com.opweave.workflow/Tests/Plugins/THIRD_PARTY_NOTICES.txt
+and the associated Tests/Plugins/Licenses/ files if those components
+are included in the distributed package.
+
+The Apache License does not grant permission to use project names,
+trademarks, or logos as endorsements.
