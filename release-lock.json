@@ -14,5 +14,9 @@
   "target_platform": "Windows 11 x64",
   "verified_unity_editor": "6000.5.11f1",
   "release_evidence": "https://github.com/pippirium/OpWeave-dev/issues/522#issuecomment-7087622052",
-  "public_repository": "pippirium/OpWeave"
+  "public_repository": "pippirium/OpWeave",
+  "license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "package_license_file": "Packages/com.opweave.workflow/LICENSE.md",
+  "license_change_class": "legal_metadata_only_post_G09_baseline"
 }
