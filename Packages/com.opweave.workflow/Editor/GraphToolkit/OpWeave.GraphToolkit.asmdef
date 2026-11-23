@@ -1,0 +1,24 @@
+{
+    "name": "OpWeave.GraphToolkit",
+    "rootNamespace": "OpWeave.GraphToolkit",
+    "references": [
+        "OpWeave.Core",
+        "OpWeave.UnityAdapter",
+        "Unity.GraphToolkit.Editor"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "UNITY_6000_5_OR_NEWER"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

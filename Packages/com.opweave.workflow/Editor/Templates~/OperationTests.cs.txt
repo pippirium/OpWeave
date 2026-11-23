@@ -1,0 +1,28 @@
+#nullable enable
+
+using NUnit.Framework;
+using OpWeave.Testing;
+using UnityEditor;
+
+namespace #TEST_NAMESPACE#
+{
+    /// <summary>
+    /// The generated contract test of <c>#OPERATION_ID#</c> (SPEC §M.6):
+    /// fill the <c>inputs</c> object once the Operation declares inputs —
+    /// the placeholder below binds nothing.
+    /// </summary>
+    internal sealed class #TEST_CLASS_NAME#
+    {
+        [TearDown]
+        public void TearDown() => Undo.ClearAll();
+
+        [Test]
+        public void Contract()
+        {
+            var inputs = new { };
+            OperationContract.AssertDescriptorValid("#OPERATION_ID#");
+            OperationContract.AssertIdempotency("#OPERATION_ID#", inputs);
+            OperationContract.AssertUndo("#OPERATION_ID#", inputs);
+        }
+    }
+}

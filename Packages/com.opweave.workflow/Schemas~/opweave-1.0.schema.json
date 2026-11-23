@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpWeave workflow document v1.0",
+  "description": "Structure of a *.opweave.json workflow document with schemaVersion \"1.0\" (SPEC A2). Rules this schema cannot express are enforced elsewhere: the single-supplier rule (one input port may have at most one explicit supplier across dataEdges, inputBindings and node parameters; R1, checked by semantic validation) and the size limits (at most 200 nodes, a 1 MiB file and 64 KiB per string parameter value; OW-WF-008, checked by the serializer).",
+  "type": "object",
+  "required": ["schemaVersion", "id", "nodes", "controlEdges"],
+  "additionalProperties": false,
+  "patternProperties": {
+    "^x-": {
+      "description": "Extension member. Top-level x-* properties are preserved by serializer round-trips (SPEC A2)."
+    }
+  },
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0",
+      "description": "Workflow document schema version, fixed to \"1.0\" by this schema (SPEC A2)."
+    },
+    "id": {
+      "type": "string",
+      "description": "Workflow ID. Grammar and uniqueness follow SPEC A4 (OW-WF-004/OW-WF-005)."
+    },
+    "title": {
+      "type": "string",
+      "description": "Optional display and search title (SPEC A8)."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional description for search and display (SPEC A8)."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional tags for search (SPEC A8)."
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/workflowInput" },
+      "description": "Workflow inputs (SPEC A6)."
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/workflowOutput" },
+      "description": "Workflow outputs (SPEC A6)."
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/node" },
+      "contains": { "$ref": "#/$defs/coreStartNode" },
+      "minContains": 1,
+      "maxContains": 1,
+      "description": "At least one node, and exactly one node with operation core.start (SPEC A2). The 200-node upper limit is stated here for documentation; it is enforced by the serializer (OW-WF-008)."
+    },
+    "controlEdges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/controlEdge" },
+      "description": "Execution order edges (SPEC A2)."
+    },
+    "dataEdges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dataEdge" },
+      "description": "Data flow edges between ports (SPEC A2). Each edge counts toward the single-supplier rule R1."
+    },
+    "inputBindings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/inputBinding" },
+      "description": "Bindings of workflow inputs to ports (SPEC A6). Each binding counts toward the single-supplier rule R1."
+    },
+    "layout": {
+      "type": "object",
+      "description": "GUI-only layout and notes (SPEC A8)."
+    }
+  },
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": ["id", "operation", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Node ID, unique within the workflow (SPEC A4 grammar)."
+        },
+        "operation": {
+          "type": "string",
+          "description": "Operation ID (SPEC A4 grammar)."
+        },
+        "version": {
+          "type": "integer",
+          "description": "Operation version."
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Constant values keyed by input port name (SPEC A5). String parameter values are limited to 64 KiB (OW-WF-008). Each entry counts toward the single-supplier rule R1."
+        },
+        "label": {
+          "type": "string",
+          "description": "Optional display label."
+        },
+        "policy": { "$ref": "#/$defs/nodePolicy" }
+      }
+    },
+    "coreStartNode": {
+      "type": "object",
+      "required": ["operation"],
+      "properties": {
+        "operation": { "const": "core.start" }
+      },
+      "description": "Matches exactly the core.start nodes. Referenced by contains with minContains/maxContains 1 to require exactly one core.start node (SPEC A2)."
+    },
+    "nodePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "Step timeout in seconds."
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "description": "Maximum number of step attempts."
+        }
+      }
+    },
+    "controlEdge": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source node id."
+        },
+        "to": {
+          "type": "string",
+          "description": "Target node id."
+        },
+        "fromPort": {
+          "type": "string",
+          "default": "next",
+          "description": "Optional control output port; defaults to \"next\". v1 accepts only \"next\" (OW-VAL-004)."
+        }
+      }
+    },
+    "portRef": {
+      "type": "object",
+      "required": ["node", "port"],
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "Node id."
+        },
+        "port": {
+          "type": "string",
+          "description": "Port name."
+        }
+      }
+    },
+    "dataEdge": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "$ref": "#/$defs/portRef" },
+        "to": { "$ref": "#/$defs/portRef" }
+      }
+    },
+    "inputBinding": {
+      "type": "object",
+      "required": ["fromInput", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "fromInput": {
+          "type": "string",
+          "description": "Workflow input id, which must be declared in inputs (SPEC A6)."
+        },
+        "to": { "$ref": "#/$defs/portRef" }
+      }
+    },
+    "workflowInput": {
+      "type": "object",
+      "required": ["id", "type", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Input id (SPEC A4 grammar)."
+        },
+        "type": {
+          "type": "string",
+          "description": "Type ID (SPEC B1)."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Whether a value must be provided at run time."
+        },
+        "default": {
+          "description": "Optional default value used when no run-time input value is given (SPEC A6)."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional description."
+        }
+      }
+    },
+    "workflowOutput": {
+      "type": "object",
+      "required": ["id", "from"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Output id (SPEC A4 grammar)."
+        },
+        "from": { "$ref": "#/$defs/portRef" },
+        "description": {
+          "type": "string",
+          "description": "Optional description."
+        }
+      }
+    }
+  }
+}

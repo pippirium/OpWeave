@@ -1,0 +1,993 @@
+#nullable enable
+
+// T-W4.5-01 [Edit] tests: local:T-W4.5-01:at02-scene-gameobject — the Runner
+// half of the SPEC §F5 contract for the five Reconcilable Operations of the
+// §I.1 Scene/GameObject group (unity.scene.create, unity.gameobject.create,
+// unity.gameobject.delete, unity.component.add, unity.component.remove):
+// a Run parked mid-flight and cut back to the bare step_started{step:0} —
+// its Execute effect applied, its recorded evidence then disturbed — must
+// be decided Unknown and end NeedsReview on the §F4 recovery pass, never
+// an automatic success and never an automatic re-execution (SPEC §F5
+// rules 1-6, §F0). The five same-domain tests drive the real
+// OpWeaveRunnerHost + FileRunStore path the T-W4.3-03 fixtures established;
+// the [UnityTest] companion runs the identical contract across a real
+// domain reload (SPEC §T.3), where every started-only disturbance in the
+// group must still end NeedsReview one domain later.
+//
+// The journal surgery and the park/recover mechanics mirror
+// ResumeBranchingHostTests / ResumeBranchingReloadTests: [step -> hold]
+// plans on the real Operations, TruncateThrough to the started-only tail,
+// and the marker-script + domain-sentinel reload of the reload companion.
+// SPEC §E2 admits at most one mutating Run per Run Store — a second
+// accept on one coordinator fails OW-RUN-002 and the §F4 pass hands the
+// exclusion to one Run only — so the reload companion parks each
+// Operation's Run in a store of its own and never disposes a phase-1
+// host: the OS exclusion each parked Run holds is a process-held handle
+// that survives the domain reload, the hand-off seam of SPEC §E2 item 3
+// the post-reload pass re-adopts.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using NUnit.Framework;
+using OpWeave.Core;
+using OpWeave.Core.Compiler;
+using OpWeave.Core.Model;
+using OpWeave.Core.Operations;
+using OpWeave.Core.Persistence;
+using OpWeave.Core.Recovery;
+using OpWeave.Core.Registry;
+using OpWeave.Core.Runtime;
+using OpWeave.Operations;
+using OpWeave.UnityAdapter;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.TestTools;
+
+namespace OpWeave.UnityAdapter.Tests
+{
+    /// <summary>
+    /// <c>local:T-W4.5-01:at02-scene-gameobject</c> recovery cases: every
+    /// Reconcilable Operation of the SPEC §I.1 Scene/GameObject group,
+    /// disturbed so its §F5 evidence row no longer holds, ends NeedsReview —
+    /// in the same domain and across a real domain reload.
+    /// </summary>
+    internal sealed class At02SceneGameObjectRecoveryTests
+    {
+        private static string ProjectRoot =>
+            Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+
+        private static string ProbeDir =>
+            Path.Combine(ProjectRoot, "Library", "OpWeaveAt02Recovery");
+
+        private static string StoreRoot => Path.Combine(ProbeDir, "run-root");
+        private static string StateFile => Path.Combine(ProbeDir, "state.txt");
+
+        // The reload group's per-Operation Run Store: five started-only
+        // Runs unfinished at once need a store each — SPEC §E2 admits at
+        // most one mutating Run per store, so a second accept on one
+        // coordinator fails OW-RUN-002, and the §F4 recovery pass drives
+        // only the single Run the exclusion passes to.
+        private static string StoreRootFor(string key) =>
+            Path.Combine(ProbeDir, "run-root-" + key);
+
+        // The group stores in phase order — WriteState persists the run
+        // ids in this order and the post-reload phase walks them the
+        // same way.
+        private static readonly string[] s_groupKeys =
+            { "scene", "add", "remove", "delete", "create" };
+
+        private static IEnumerable<string> AllStoreRoots()
+        {
+            yield return StoreRoot;
+            for (var i = 0; i < s_groupKeys.Length; i++)
+            {
+                yield return StoreRootFor(s_groupKeys[i]);
+            }
+        }
+
+        private const string ProbeFolder = "Assets/OpWeaveAt02Resume";
+        private const string BaseScenePath = ProbeFolder + "/Base.unity";
+        private const string CreatedScenePath = ProbeFolder + "/Created.unity";
+        private static string CreatedSceneDisk =>
+            Path.Combine(
+                ProjectRoot, CreatedScenePath.Replace('/', Path.DirectorySeparatorChar));
+
+        private static string MarkerFolder => "Assets/Editor/OpWeaveAt02Reload";
+        private static string MarkerDisk =>
+            Path.Combine(
+                ProjectRoot, MarkerFolder.Replace('/', Path.DirectorySeparatorChar));
+
+        private const string MarkerSource =
+            "#nullable enable\n" +
+            "namespace OpWeaveAt02Reload\n{\n" +
+            "    internal static class ReloadMarker\n" +
+            "    {\n" +
+            "        public const int Value = 1;\n" +
+            "    }\n" +
+            "}\n";
+
+        private const string WorkflowId = "example.at02.recovery";
+        private const string HoldOp = "test.at02.resume.hold";
+        private const string AddTargetName = "At02ResAdd";
+        private const string RemoveTargetName = "At02ResRemove";
+        private const string DeleteTargetName = "At02ResDelete";
+        private const string CreateTargetName = "At02ResCreate";
+        private const string CreateTamperedName = "At02ResCreateTampered";
+
+        private static readonly UTF8Encoding s_utf8 = new UTF8Encoding(false);
+
+        private static object? s_domainSentinel;
+        private static void ArmDomainSentinel() => s_domainSentinel = new object();
+        private static bool DomainSentinelAlive => s_domainSentinel is not null;
+
+        private static void Crumb(string message) => Debug.Log("[W4501] " + message);
+
+        private readonly List<RunnerHostFixture> _fixtures =
+            new List<RunnerHostFixture>();
+
+        [Serializable]
+        private sealed class PhaseResult
+        {
+            public bool Ok;
+            public string Failure = string.Empty;
+
+            public static PhaseResult Pass() => new PhaseResult { Ok = true };
+
+            public static PhaseResult Fail(string message) =>
+                new PhaseResult { Failure = message };
+        }
+
+        // ── Setup / cleanup ─────────────────────────────────────────────
+
+        // No plain [SetUp]/[TearDown]: NUnit's setup/teardown command keeps
+        // no persisted state, so a [UnityTest] resumed across a domain
+        // reload runs [SetUp] again before the iterator continues — here
+        // that deleted ProbeDir and the phase-1 state file mid-test. The
+        // cleanup lives in [UnitySetUp]/[UnityTearDown], the persisted
+        // outer command the runner executes exactly once per test for
+        // [Test] and [UnityTest] alike — the ResumeBranchingReloadTests
+        // structure.
+        [UnitySetUp]
+        public IEnumerator UnitySetUp()
+        {
+            NewUntitledScene();
+            if (CleanupArtifacts())
+            {
+                yield return new RecompileScripts(false);
+            }
+            NewBaseScene();
+        }
+
+        [UnityTearDown]
+        public IEnumerator UnityTearDown()
+        {
+            DisposeAll();
+            NewUntitledScene();
+            ClearHandoffRecords();
+            if (CleanupArtifacts())
+            {
+                yield return new RecompileScripts(false);
+            }
+        }
+
+        private void DisposeAll()
+        {
+            foreach (var fixture in _fixtures)
+            {
+                fixture.Dispose();
+            }
+            _fixtures.Clear();
+        }
+
+        // A saved, clean base scene: the Operations under test need a loaded
+        // scene to work in, and the additive scene.create requires no
+        // untitled scene to be open (OW-UNITY-011).
+        private static void NewBaseScene()
+        {
+            if (!AssetDatabase.IsValidFolder(ProbeFolder))
+            {
+                AssetDatabase.CreateFolder("Assets", "OpWeaveAt02Resume");
+            }
+            var scene = EditorSceneManager.NewScene(
+                NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            Assert.That(
+                EditorSceneManager.SaveScene(scene, BaseScenePath), Is.True,
+                "the recovery test's base scene must save.");
+        }
+
+        private static void NewUntitledScene() =>
+            EditorSceneManager.NewScene(
+                NewSceneSetup.EmptyScene, NewSceneMode.Single);
+
+        // The T-W4.3-01 cleanup contract, verbatim in shape, once per Run
+        // Store the fixture touches: the exclusion this process still
+        // holds on a probe root — the previous domain's or a fixture's —
+        // is taken through the hand-off seam and ended the orderly way so
+        // lock.json empties BEFORE the handle frees; then both hand-off
+        // records drop.
+        private static void ReleaseLeakedState()
+        {
+            foreach (var storeRoot in AllStoreRoots())
+            {
+                ReleaseLeakedState(storeRoot);
+            }
+        }
+
+        private static void ReleaseLeakedState(string storeRoot)
+        {
+            var obtained = RunLockHandoff.TryObtain(storeRoot);
+            if (!obtained.Ok || obtained.Value is not { } held)
+            {
+                Crumb("the probe Run Store is excluded elsewhere: " +
+                    Describe(obtained.Diagnostics));
+                RunLockHandoff.Clear(storeRoot);
+                return;
+            }
+            if (!held.Release().Ok)
+            {
+                held.Dispose();
+            }
+            RunLockHandoff.Clear(storeRoot);
+        }
+
+        private static void ClearHandoffRecords()
+        {
+            foreach (var storeRoot in AllStoreRoots())
+            {
+                RunLockHandoff.Clear(storeRoot);
+            }
+        }
+
+        private static bool CleanupArtifacts()
+        {
+            ReleaseLeakedState();
+            if (Directory.Exists(ProbeDir))
+            {
+                try { Directory.Delete(ProbeDir, recursive: true); }
+                catch (Exception) { /* a still-held file stays for the next run */ }
+            }
+            var dirty = false;
+            if (AssetDatabase.IsValidFolder(ProbeFolder))
+            {
+                AssetDatabase.DeleteAsset(ProbeFolder);
+                dirty = true;
+            }
+            if (AssetDatabase.IsValidFolder(MarkerFolder))
+            {
+                AssetDatabase.DeleteAsset(MarkerFolder);
+                dirty = true;
+            }
+            if (Directory.Exists(MarkerDisk))
+            {
+                Directory.Delete(MarkerDisk, recursive: true);
+                dirty = true;
+            }
+            return dirty;
+        }
+
+        // ── Fixtures, plans, accept/tick/recover ────────────────────────
+
+        private RunnerHostFixture NewFixture()
+        {
+            var fixture = new RunnerHostFixture(StoreRoot);
+            _fixtures.Add(fixture);
+            fixture.Probe.Know("UnityEngine.BoxCollider");
+            RegisterAll(fixture);
+            return fixture;
+        }
+
+        private void DisposeFixture(RunnerHostFixture fixture)
+        {
+            fixture.Dispose();
+            _fixtures.Remove(fixture);
+        }
+
+        // Every Reconcilable Operation of the group plus the hold step, at
+        // the seeds the parked plans' fingerprints were built with — a fresh
+        // host must resolve each step's implementation after a host swap or
+        // a domain reload.
+        private static void RegisterAll(RunnerHostFixture fixture)
+        {
+            RegisterAs(fixture, new CreateSceneOperation(), 'a', OperationOrigin.Standard);
+            RegisterAs(fixture, new GameObjectCreateOperation(), 'c', OperationOrigin.Standard);
+            RegisterAs(fixture, new GameObjectDeleteOperation(), 'e', OperationOrigin.Standard);
+            RegisterAs(fixture, new ComponentAddOperation(), '0', OperationOrigin.Standard);
+            RegisterAs(fixture, new ComponentRemoveOperation(), '2', OperationOrigin.Standard);
+            fixture.Register(new RunnerHostFixture.ControlledWaitableOperation(HoldOp), '4');
+        }
+
+        private static void RegisterAs(
+            RunnerHostFixture fixture, IOperation op, char hashSeed, OperationOrigin origin) =>
+            fixture.Operations.Add(new RegisteredOperation(
+                op.Descriptor,
+                origin,
+                "Example.Operations",
+                null,
+                new string(hashSeed, 64),
+                new string((char)(hashSeed + 1), 64))
+            {
+                Implementation = op,
+            });
+
+        private static PlanStep Step(
+            int index,
+            string nodeId,
+            string operationId,
+            char hashSeed,
+            IReadOnlyDictionary<string, InputSource>? inputs = null,
+            IReadOnlyDictionary<string, string>? outputTypes = null,
+            int next = -1,
+            Idempotency idempotency = Idempotency.Unsafe) =>
+            RunnerHostFixture.Step(
+                index, nodeId, operationId, hashSeed,
+                inputs: inputs, outputTypes: outputTypes,
+                next: next, idempotency: idempotency);
+
+        private static WorkflowDocument Doc(
+            IReadOnlyList<(string id, string operation)> nodes,
+            params (string from, string to)[] edges) =>
+            RunnerHostFixture.Doc(
+                WorkflowId,
+                nodes
+                    .Select(n => new NodeData { Id = n.id, Operation = n.operation, Version = 1 })
+                    .ToList(),
+                edges
+                    .Select(e => new ControlEdge(e.from, e.to))
+                    .ToList());
+
+        private static string Accept(
+            RunnerHostFixture fixture, CompiledPlan plan, WorkflowDocument doc)
+        {
+            var accepted = fixture.Host.AcceptRun(
+                plan, doc, ActorKind.Agent, new AcceptOptions(null, false));
+            Assert.IsTrue(accepted.Ok, "accept failed: " + Describe(accepted.Diagnostics));
+            return accepted.Value!.RunId;
+        }
+
+        private static void Tick(RunnerHostFixture fixture)
+        {
+            fixture.Clock.Advance(TimeSpan.FromSeconds(1));
+            var tick = fixture.Host.Tick();
+            Assert.IsTrue(tick.Ok, "the tick failed: " + Describe(tick.Diagnostics));
+        }
+
+        private static RunRecoveryReport Recover(RunnerHostFixture fixture)
+        {
+            var recovered = fixture.Host.RecoverRuns();
+            Assert.IsTrue(recovered.Ok, "the recovery pass failed: " +
+                Describe(recovered.Diagnostics));
+            Assert.IsNotNull(recovered.Value);
+            return recovered.Value!;
+        }
+
+        private static void AssertNeedsReview(
+            string storeRoot, RunnerHostFixture fixture, string runId, string because)
+        {
+            Assert.AreEqual(
+                RunState.NeedsReview,
+                fixture.Host.Coordinator.StateOf(runId),
+                because + " must end in NeedsReview; journal: " + string.Join(
+                    " | ", RunnerHostFixture.JournalLines(storeRoot, runId)));
+            Assert.IsFalse(
+                RunnerHostFixture.JournalHas(
+                    storeRoot, runId, "\"type\":\"run_resumed\""),
+                because + ": a review-needed resume never journals run_resumed");
+            Assert.IsTrue(
+                RunnerHostFixture.JournalHasAll(
+                    storeRoot, runId, "\"type\":\"step_needs_review\"", "\"step\":0"),
+                because + ": the Unknown verdict is journaled step_needs_review (§E1)");
+        }
+
+        private static string Describe(IReadOnlyList<Diagnostic> diagnostics)
+        {
+            if (diagnostics.Count == 0)
+            {
+                return "<no diagnostics>";
+            }
+            var parts = new List<string>();
+            foreach (var diagnostic in diagnostics)
+            {
+                parts.Add(diagnostic.Code + " " + diagnostic.Message);
+            }
+            return string.Join("; ", parts);
+        }
+
+        // ── Journal surgery ─────────────────────────────────────────────
+
+        private static string[] Lines(string storeRoot, string runId) =>
+            RunnerHostFixture.JournalLines(storeRoot, runId);
+
+        private static void WriteLines(
+            string storeRoot, string runId, IEnumerable<string> lines)
+        {
+            File.WriteAllText(
+                RunnerHostFixture.JournalPath(storeRoot, runId),
+                string.Join("\n", lines) + "\n", s_utf8);
+        }
+
+        // Keeps the records through the FIRST line carrying both fragments —
+        // the crash window between that durable record and whatever the loop
+        // was about to append next.
+        private static void TruncateThrough(
+            string storeRoot, string runId, string typeFragment, string stepFragment)
+        {
+            var lines = Lines(storeRoot, runId);
+            var cut = -1;
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains(typeFragment) && lines[i].Contains(stepFragment))
+                {
+                    cut = i;
+                    break;
+                }
+            }
+            Assert.GreaterOrEqual(cut, 0,
+                "the journal never recorded " + typeFragment + " " + stepFragment +
+                ": " + string.Join(" | ", lines));
+            WriteLines(storeRoot, runId, lines.Take(cut + 1));
+        }
+
+        // The regression guard of the started-only fixtures: the journal the
+        // recovering host reads must END at the bare step_started{step} — a
+        // record past it is a two-steps-in-flight journal the §F4 rebuild
+        // correctly refuses, never the interruption the fixture means to
+        // leave.
+        private static void AssertStartedOnlyTail(string storeRoot, string runId, int step)
+        {
+            var tail = Lines(storeRoot, runId);
+            Assert.IsTrue(
+                tail.Length > 0 &&
+                tail[tail.Length - 1].Contains("\"type\":\"step_started\"") &&
+                tail[tail.Length - 1].Contains("\"step\":" + step),
+                "the journal must end at step " + step +
+                "'s step_started with no later records; journal: " +
+                string.Join(" | ", tail));
+        }
+
+        private static void WriteState(params string[] lines)
+        {
+            Directory.CreateDirectory(ProbeDir);
+            File.WriteAllText(StateFile, string.Join("\n", lines) + "\n", s_utf8);
+        }
+
+        private static string[] ReadState()
+        {
+            Assert.IsTrue(File.Exists(StateFile), "the phase-1 state file is missing");
+            return File.ReadAllLines(StateFile);
+        }
+
+        private static void ArmReload()
+        {
+            Directory.CreateDirectory(MarkerDisk);
+            File.WriteAllText(
+                Path.Combine(MarkerDisk, "ReloadMarker.cs"), MarkerSource);
+            AssetDatabase.Refresh();
+            ArmDomainSentinel();
+        }
+
+        // ── The [op -> hold] park ───────────────────────────────────────
+
+        // Accepts [step -> hold] and ticks once: step 0 executes, step 1's
+        // waitable parks the Run mid-flight — the interruption the journal
+        // then fakes by truncation back to the bare step_started{step:0}.
+        private static string ParkStartedOnly(
+            RunnerHostFixture fixture,
+            string opId,
+            char hashSeed,
+            IReadOnlyDictionary<string, InputSource> inputs,
+            IReadOnlyDictionary<string, string> outputTypes)
+        {
+            var steps = new[]
+            {
+                Step(0, "s", opId, hashSeed, next: 1,
+                    idempotency: Idempotency.Reconcilable,
+                    inputs: inputs, outputTypes: outputTypes),
+                Step(1, "h", HoldOp, '4', next: -1,
+                    idempotency: Idempotency.Idempotent),
+            };
+            var plan = RunnerHostFixture.Plan(WorkflowId, steps);
+            var doc = Doc(new[] { ("s", opId), ("h", HoldOp) }, ("s", "h"));
+            var runId = Accept(fixture, plan, doc);
+            Tick(fixture);
+            Assert.AreEqual(
+                RunState.Running, fixture.Host.Coordinator.StateOf(runId),
+                "the " + opId + " Run did not park mid-flight; journal: " +
+                string.Join(" | ", Lines(fixture.Root, runId)));
+            return runId;
+        }
+
+        // ── Plan inputs ─────────────────────────────────────────────────
+
+        private static Dictionary<string, InputSource> GameObjectTargetInputs(
+            string name) =>
+            new Dictionary<string, InputSource>
+            {
+                ["target"] = new Constant(RunnerHostFixture.Json(
+                    "{\"kind\":\"gameObject\",\"path\":\"/" + name + "\"}")),
+            };
+
+        private static readonly IReadOnlyDictionary<string, string> s_noOutputs =
+            new Dictionary<string, string>();
+
+        private static readonly IReadOnlyDictionary<string, string> s_gameObjectOut =
+            new Dictionary<string, string>
+            {
+                ["gameObject"] = "unity.GameObjectRef",
+            };
+
+        private static readonly IReadOnlyDictionary<string, string> s_componentOut =
+            new Dictionary<string, string>
+            {
+                ["component"] = "unity.ComponentRef<unity.Component>",
+            };
+
+        private static readonly IReadOnlyDictionary<string, string> s_sceneOut =
+            new Dictionary<string, string>
+            {
+                ["scene"] = "unity.SceneRef",
+            };
+
+        private static Dictionary<string, InputSource> SceneCreateInputs() =>
+            new Dictionary<string, InputSource>
+            {
+                ["path"] = new Constant(RunnerHostFixture.Json(
+                    "\"" + CreatedScenePath + "\"")),
+                ["setup"] = new Constant(RunnerHostFixture.Json("\"empty\"")),
+                ["mode"] = new Constant(RunnerHostFixture.Json("\"additive\"")),
+            };
+
+        private static Dictionary<string, InputSource> GameObjectCreateInputs() =>
+            new Dictionary<string, InputSource>
+            {
+                ["name"] = new Constant(
+                    RunnerHostFixture.Json("\"" + CreateTargetName + "\"")),
+            };
+
+        private static Dictionary<string, InputSource> ComponentAddInputs() =>
+            new Dictionary<string, InputSource>
+            {
+                ["target"] = new Constant(RunnerHostFixture.Json(
+                    "{\"kind\":\"gameObject\",\"path\":\"/" + AddTargetName + "\"}")),
+                ["componentType"] = new Constant(
+                    RunnerHostFixture.Json("\"UnityEngine.BoxCollider\"")),
+            };
+
+        // ── SPEC §F5 across a host swap: every Reconcilable of the group ─
+
+        // unity.scene.create: the Run created+loaded the scene, the journal
+        // ends at step_started — then the created scene is closed, the live
+        // state the recorded 'loaded' evidence can no longer prove.
+        [Test]
+        public void SceneCreate_StartedOnlyDisturbedBecomesNeedsReview()
+        {
+            var fixture1 = NewFixture();
+            var runId = ParkStartedOnly(
+                fixture1, CreateSceneOperation.OperationId, 'a',
+                SceneCreateInputs(), s_sceneOut);
+            var created = SceneManager.GetSceneByPath(CreatedScenePath);
+            Assert.IsTrue(created.isLoaded,
+                "the first Execute did not create+load the scene");
+            TruncateThrough(StoreRoot, runId, "\"type\":\"step_started\"", "\"step\":0");
+            DisposeFixture(fixture1);
+            // Evidence the snapshot can no longer prove: the scene asset
+            // exists but is not loaded the way the recorded mode requires.
+            Assert.That(
+                EditorSceneManager.CloseScene(created, removeScene: true), Is.True,
+                "the created scene refused to close");
+
+            var fixture2 = NewFixture();
+            var report = Recover(fixture2);
+            Assert.IsTrue(report.ExclusionHeld);
+            AssertNeedsReview(
+                StoreRoot, fixture2, runId, "a disturbed scene.create evidence row");
+            Assert.IsNotNull(
+                AssetDatabase.LoadAssetAtPath<SceneAsset>(CreatedScenePath),
+                "NeedsReview removed nothing — the created scene asset stays");
+            Assert.IsFalse(
+                SceneManager.GetSceneByPath(CreatedScenePath).isLoaded,
+                "NeedsReview re-opened nothing — a re-execution never ran");
+        }
+
+        // unity.gameobject.create: the new child is renamed — the one
+        // evidence check its Completed requires that no other outcome can
+        // fake.
+        [Test]
+        public void GameObjectCreate_StartedOnlyDisturbedBecomesNeedsReview()
+        {
+            var fixture1 = NewFixture();
+            var runId = ParkStartedOnly(
+                fixture1, GameObjectCreateOperation.OperationId, 'c',
+                GameObjectCreateInputs(), s_gameObjectOut);
+            var created = GameObject.Find(CreateTargetName);
+            Assert.IsNotNull(created, "the first Execute did not create the object");
+            TruncateThrough(StoreRoot, runId, "\"type\":\"step_started\"", "\"step\":0");
+            DisposeFixture(fixture1);
+            created!.name = CreateTamperedName;
+
+            var fixture2 = NewFixture();
+            var report = Recover(fixture2);
+            Assert.IsTrue(report.ExclusionHeld);
+            AssertNeedsReview(
+                StoreRoot, fixture2, runId, "a disturbed gameobject.create evidence row");
+            Assert.IsNull(
+                GameObject.Find(CreateTargetName),
+                "a re-execution would have created a second object of the " +
+                "recorded name");
+            Assert.IsNotNull(
+                GameObject.Find(CreateTamperedName),
+                "NeedsReview removed nothing — the created object stays");
+        }
+
+        // unity.gameobject.delete: a foreign same-named root takes the
+        // deleted object's slot — the recorded children list matches
+        // neither the live list nor the snapshot-minus-target.
+        [Test]
+        public void GameObjectDelete_StartedOnlyDisturbedBecomesNeedsReview()
+        {
+            var fixture1 = NewFixture();
+            var target = new GameObject(DeleteTargetName);
+            Assert.IsNotNull(target);
+            var runId = ParkStartedOnly(
+                fixture1, GameObjectDeleteOperation.OperationId, 'e',
+                GameObjectTargetInputs(DeleteTargetName), s_noOutputs);
+            Assert.IsNull(
+                GameObject.Find(DeleteTargetName),
+                "the first Execute did not delete the target");
+            TruncateThrough(StoreRoot, runId, "\"type\":\"step_started\"", "\"step\":0");
+            DisposeFixture(fixture1);
+            // A foreign object the recorded evidence cannot place: absence
+            // alone would prove the delete, but a replacement cannot be
+            // told from the original by name.
+            var foreign = new GameObject(DeleteTargetName);
+            Assert.IsNotNull(foreign);
+
+            var fixture2 = NewFixture();
+            var report = Recover(fixture2);
+            Assert.IsTrue(report.ExclusionHeld);
+            AssertNeedsReview(
+                StoreRoot, fixture2, runId, "a disturbed gameobject.delete evidence row");
+            Assert.IsNotNull(
+                GameObject.Find(DeleteTargetName),
+                "NeedsReview neither deletes the foreign object nor restores " +
+                "the original — a re-execution would have deleted it");
+        }
+
+        // unity.component.add: one more component the recorded list never
+        // saw — the live list is neither the snapshot nor the snapshot plus
+        // exactly the recorded addition.
+        [Test]
+        public void ComponentAdd_StartedOnlyDisturbedBecomesNeedsReview()
+        {
+            var fixture1 = NewFixture();
+            var target = new GameObject(AddTargetName);
+            var runId = ParkStartedOnly(
+                fixture1, ComponentAddOperation.OperationId, '0',
+                ComponentAddInputs(), s_componentOut);
+            Assert.IsNotNull(
+                target.GetComponent<BoxCollider>(),
+                "the first Execute did not add the component");
+            TruncateThrough(StoreRoot, runId, "\"type\":\"step_started\"", "\"step\":0");
+            DisposeFixture(fixture1);
+            target.AddComponent<BoxCollider>();
+
+            var fixture2 = NewFixture();
+            var report = Recover(fixture2);
+            Assert.IsTrue(report.ExclusionHeld);
+            AssertNeedsReview(
+                StoreRoot, fixture2, runId, "a disturbed component.add evidence row");
+            Assert.AreEqual(
+                2, target.GetComponents<BoxCollider>().Length,
+                "NeedsReview neither adds nor removes — a re-execution " +
+                "would have added a third component");
+        }
+
+        // unity.component.remove: a foreign component the recorded lists
+        // cannot place — the live list is neither the snapshot nor the
+        // snapshot minus the removed entry.
+        [Test]
+        public void ComponentRemove_StartedOnlyDisturbedBecomesNeedsReview()
+        {
+            var fixture1 = NewFixture();
+            var target = new GameObject(RemoveTargetName);
+            var collider = target.AddComponent<BoxCollider>();
+            var componentRef = new RefResolver().ToRef(
+                collider, "unity.ComponentRef<unity.Component>");
+            var runId = ParkStartedOnly(
+                fixture1, ComponentRemoveOperation.OperationId, '2',
+                new Dictionary<string, InputSource>
+                {
+                    ["component"] = new Constant(componentRef),
+                },
+                s_noOutputs);
+            Assert.IsNull(
+                target.GetComponent<BoxCollider>(),
+                "the first Execute did not remove the component");
+            TruncateThrough(StoreRoot, runId, "\"type\":\"step_started\"", "\"step\":0");
+            DisposeFixture(fixture1);
+            target.AddComponent<Rigidbody>();
+
+            var fixture2 = NewFixture();
+            var report = Recover(fixture2);
+            Assert.IsTrue(report.ExclusionHeld);
+            AssertNeedsReview(
+                StoreRoot, fixture2, runId, "a disturbed component.remove evidence row");
+            Assert.IsNull(
+                target.GetComponent<BoxCollider>(),
+                "NeedsReview does not restore what Execute removed");
+            Assert.IsNotNull(
+                target.GetComponent<Rigidbody>(),
+                "NeedsReview does not remove the foreign component either");
+        }
+
+        // ── SPEC §F5 across a real domain reload ────────────────────────
+
+        // The SPEC §T.3 reload case the AT-02 check requires: all five
+        // Reconcilable Operations of the group, each parked started-only
+        // with its evidence disturbed, must still be decided Unknown and
+        // end NeedsReview in the domain the compile creates — never an
+        // automatic success and never an automatic re-execution (§F0).
+        [UnityTest]
+        [Timeout(240000)]
+        public IEnumerator StartedOnlyDisturbedBecomesNeedsReviewAcrossTheRealReload()
+        {
+            var before = StartedOnlyGroupPhase();
+            Crumb("phase-1 ok=" + before.Ok + " failure=" + before.Failure);
+            Assert.That(before.Ok, Is.True,
+                "pre-reload phase failed: " + before.Failure);
+
+            yield return new RecompileScripts();
+            var guard = 0;
+            while (DomainSentinelAlive && guard++ < 10000)
+            {
+                yield return null;
+            }
+            Assert.IsFalse(DomainSentinelAlive,
+                "the probe compile did not produce a domain reload");
+
+            var after = StartedOnlyGroupPhaseAfter();
+            Crumb("phase-2 ok=" + after.Ok + " failure=" + after.Failure);
+            Assert.That(after.Ok, Is.True,
+                "post-reload phase failed: " + after.Failure);
+        }
+
+        // One phase-1 host on a Run Store of its own — never installed,
+        // so no editor-update tick can pump its parked hold past the
+        // truncation point, and never disposed on the pass path: the OS
+        // exclusion its parked Run holds is the process-held handle the
+        // hand-off seam carries across the domain reload.
+        private static RunnerHostFixture GroupFixture(
+            List<RunnerHostFixture> fixtures, int index)
+        {
+            var fixture = new RunnerHostFixture(StoreRootFor(s_groupKeys[index]));
+            fixtures.Add(fixture);
+            fixture.Probe.Know("UnityEngine.BoxCollider");
+            RegisterAll(fixture);
+            return fixture;
+        }
+
+        private static void DisposeFixtures(List<RunnerHostFixture> fixtures)
+        {
+            for (var i = 0; i < fixtures.Count; i++)
+            {
+                fixtures[i].Dispose();
+            }
+            fixtures.Clear();
+        }
+
+        // Phase 1: each [op -> hold] Run — one per Run Store, the SPEC
+        // §E2 single-mutating-Run shape — executes step 0 and waits on
+        // the hold; the evidence row it journaled is disturbed in the
+        // world, and every journal is cut back to the bare
+        // step_started{step:0} a real interruption would have left.
+        private static PhaseResult StartedOnlyGroupPhase()
+        {
+            var fixtures = new List<RunnerHostFixture>();
+            try
+            {
+                var runIds = new string[s_groupKeys.Length];
+
+                // unity.scene.create first: its Execute leaves the created
+                // scene ACTIVE, so its disturbance — closing that scene —
+                // runs before the other steps park, returning the base
+                // scene to active for everything that follows.
+                var runScene = ParkStartedOnly(
+                    GroupFixture(fixtures, 0), CreateSceneOperation.OperationId,
+                    'a', SceneCreateInputs(), s_sceneOut);
+                var createdScene = SceneManager.GetSceneByPath(CreatedScenePath);
+                if (!createdScene.isLoaded)
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the scene.create Execute did not create+load the scene");
+                }
+                if (!EditorSceneManager.CloseScene(createdScene, removeScene: true))
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the created scene refused to close");
+                }
+                runIds[0] = runScene;
+
+                var addTarget = new GameObject(AddTargetName);
+                var runAdd = ParkStartedOnly(
+                    GroupFixture(fixtures, 1), ComponentAddOperation.OperationId,
+                    '0', ComponentAddInputs(), s_componentOut);
+                if (addTarget.GetComponent<BoxCollider>() == null)
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the component.add Execute did not add the component");
+                }
+                addTarget.AddComponent<BoxCollider>();
+                runIds[1] = runAdd;
+
+                var removeTarget = new GameObject(RemoveTargetName);
+                var collider = removeTarget.AddComponent<BoxCollider>();
+                var removeRef = new RefResolver().ToRef(
+                    collider, "unity.ComponentRef<unity.Component>");
+                var runRemove = ParkStartedOnly(
+                    GroupFixture(fixtures, 2), ComponentRemoveOperation.OperationId,
+                    '2',
+                    new Dictionary<string, InputSource>
+                    {
+                        ["component"] = new Constant(removeRef),
+                    },
+                    s_noOutputs);
+                if (removeTarget.GetComponent<BoxCollider>() != null)
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the component.remove Execute did not remove the component");
+                }
+                removeTarget.AddComponent<Rigidbody>();
+                runIds[2] = runRemove;
+
+                _ = new GameObject(DeleteTargetName);
+                var runDelete = ParkStartedOnly(
+                    GroupFixture(fixtures, 3), GameObjectDeleteOperation.OperationId,
+                    'e', GameObjectTargetInputs(DeleteTargetName), s_noOutputs);
+                if (GameObject.Find(DeleteTargetName) != null)
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the gameobject.delete Execute did not delete the target");
+                }
+                var foreign = new GameObject(DeleteTargetName);
+                runIds[3] = runDelete;
+
+                var runCreate = ParkStartedOnly(
+                    GroupFixture(fixtures, 4), GameObjectCreateOperation.OperationId,
+                    'c', GameObjectCreateInputs(), s_gameObjectOut);
+                var created = GameObject.Find(CreateTargetName);
+                if (created == null)
+                {
+                    DisposeFixtures(fixtures);
+                    return PhaseResult.Fail(
+                        "the gameobject.create Execute did not create the object");
+                }
+                created.name = CreateTamperedName;
+                runIds[4] = runCreate;
+
+                // The parked holds need no ticks stopped: a phase-1 host
+                // is never installed, so nothing pumps a step record past
+                // the truncated tail — each journal is cut back to the
+                // bare step_started{step:0} in its own store.
+                for (var i = 0; i < fixtures.Count; i++)
+                {
+                    TruncateThrough(
+                        fixtures[i].Root, runIds[i],
+                        "\"type\":\"step_started\"", "\"step\":0");
+                    AssertStartedOnlyTail(fixtures[i].Root, runIds[i], 0);
+                }
+                WriteState(runIds);
+                ArmReload();
+                Crumb("phase-1 complete: five disturbed started-only runs, " +
+                    "scene=" + runScene + " add=" + runAdd +
+                    " remove=" + runRemove + " delete=" + runDelete +
+                    " create=" + runCreate);
+                return PhaseResult.Pass();
+            }
+            catch (Exception e)
+            {
+                DisposeFixtures(fixtures);
+                return PhaseResult.Fail(
+                    "phase-1 threw " + e.GetType().Name + ": " + e.Message);
+            }
+        }
+
+        // Phase 2: same Editor session (SessionState survives the reload),
+        // same live objects — a fresh-domain §F4 pass per Run Store reads
+        // one started-only journal and one disturbed world: the surviving
+        // OS handle re-adopts, the exclusion passes to the Run lock.json
+        // names, and each verdict is Unknown — NeedsReview, no
+        // run_resumed, no re-execution — with every disturbed artifact
+        // exactly as the disturbance left it.
+        private static PhaseResult StartedOnlyGroupPhaseAfter()
+        {
+            var fixtures = new List<RunnerHostFixture>();
+            try
+            {
+                var persisted = ReadState();
+                Assert.AreEqual(
+                    s_groupKeys.Length, persisted.Length,
+                    "the phase-1 state file lost a run id");
+
+                for (var i = 0; i < s_groupKeys.Length; i++)
+                {
+                    var fixture = new RunnerHostFixture(
+                        StoreRootFor(s_groupKeys[i]));
+                    fixtures.Add(fixture);
+                    fixture.Probe.Know("UnityEngine.BoxCollider");
+                    RegisterAll(fixture);
+                    fixture.Editor.IsCompiling = EditorApplication.isCompiling;
+                    AssertStartedOnlyTail(fixture.Root, persisted[i], 0);
+                }
+                var names = new[]
+                {
+                    "scene.create", "component.add", "component.remove",
+                    "gameobject.delete", "gameobject.create",
+                };
+                for (var i = 0; i < fixtures.Count; i++)
+                {
+                    var report = Recover(fixtures[i]);
+                    Assert.IsTrue(
+                        report.ExclusionHeld,
+                        "the " + s_groupKeys[i] +
+                            " store's recovery pass could not take its exclusion");
+                    AssertNeedsReview(
+                        fixtures[i].Root, fixtures[i], persisted[i],
+                        "a disturbed " + names[i] + " evidence row across a reload");
+                }
+
+                var addTarget = GameObject.Find(AddTargetName);
+                Assert.IsNotNull(addTarget,
+                    "the component.add target did not survive the reload");
+                Assert.AreEqual(
+                    2, addTarget!.GetComponents<BoxCollider>().Length,
+                    "NeedsReview across a reload neither adds nor removes — " +
+                    "a re-execution would have added a third component");
+                var removeTarget = GameObject.Find(RemoveTargetName);
+                Assert.IsNotNull(removeTarget,
+                    "the component.remove target did not survive the reload");
+                Assert.IsNull(
+                    removeTarget!.GetComponent<BoxCollider>(),
+                    "NeedsReview does not restore what Execute removed");
+                Assert.IsNotNull(
+                    removeTarget.GetComponent<Rigidbody>(),
+                    "NeedsReview does not remove the foreign component either");
+                Assert.IsNotNull(
+                    GameObject.Find(DeleteTargetName),
+                    "NeedsReview neither deletes the foreign object nor " +
+                    "restores the original");
+                Assert.IsNull(
+                    GameObject.Find(CreateTargetName),
+                    "a re-execution would have created a second object of " +
+                    "the recorded name");
+                Assert.IsNotNull(
+                    GameObject.Find(CreateTamperedName),
+                    "NeedsReview removed nothing — the created object stays");
+                Assert.IsTrue(
+                    File.Exists(CreatedSceneDisk),
+                    "NeedsReview removed nothing — the created scene asset stays");
+                Assert.IsFalse(
+                    SceneManager.GetSceneByPath(CreatedScenePath).isLoaded,
+                    "NeedsReview re-opened nothing — a re-execution never ran");
+                DisposeFixtures(fixtures);
+                Crumb("phase-2 complete: five NeedsReview verdicts");
+                return PhaseResult.Pass();
+            }
+            catch (Exception e)
+            {
+                DisposeFixtures(fixtures);
+                return PhaseResult.Fail(
+                    "phase-2 threw " + e.GetType().Name + ": " + e.Message);
+            }
+        }
+    }
+}

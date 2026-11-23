@@ -1,0 +1,5 @@
+#NAMESPACEBEGIN#
+public class #SCRIPTNAME#
+{
+}
+#NAMESPACEEND#

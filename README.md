@@ -2,24 +2,69 @@
 
 [日本語](README.ja.md)
 
-OpWeave is a Unity Editor workflow tool for discovering, connecting, and executing typed operations. Windows v1 has completed development acceptance; public package distribution is being prepared.
+OpWeave is a Unity Editor workflow engine: it discovers typed operations, lets you compose them into workflow documents, compiles and executes them, and recovers interrupted runs from durable journals. It ships as the UPM package `com.opweave.workflow` version **0.1.0**, licensed under [Apache License 2.0](LICENSE).
 
-## Status
+## Windows v1 capabilities
 
-**Windows v1 development is complete and verified, but this public repository does not yet contain the distributable Unity package.** The agreed version is **0.1.0**, recorded in [VERSION](VERSION) and [release-lock.json](release-lock.json). No public release tag or supported installation procedure exists yet.
+- **Operation catalog** — search built-in and extension operations by type, port compatibility, and declared side effects.
+- **Visual workflow authoring** — a node editor with separate control-flow and data-flow connections, backed by a canonical `.opweave.json` document.
+- **Compilation and validation** — deterministic workflow compilation with typed port checking and stable plan hashing.
+- **Sequential execution** — ordered step execution that waits for each operation's declared completion condition and records results and diagnostics.
+- **Recovery** — durable intent/journal records so an interrupted save or run reconciles to a reviewable state instead of silently losing or duplicating work.
+- **Agent API** — a structured interface for AI agents to discover operations, inspect schemas, and validate workflows.
+- **Extensibility** — third-party operations, type providers, and codecs via a public extension contract.
 
-## Windows v1 capabilities (verified development build)
+## Requirements
 
-- Search an operation catalog by type, compatibility, and side effects.
-- Build workflows with a visual node editor and separate control and data connections.
-- Validate workflows and execute operations sequentially, waiting for their declared completion conditions.
-- Track execution state and errors, with operation-specific information about Undo and reruns.
-- Provide an interface for AI agents to discover operations and validate workflows.
+- **Operating system:** Windows 11 x64
+- **Verified Unity Editor:** 6000.5.11f1 (the package manifest floor is `6000.0`; the verified support target is 6000.5.11f1)
+- macOS and Linux are **not supported in v1** (deferred; see Known limitations).
 
-The initial scope is Unity Editor editing operations. Runtime visual scripting, other applications, and unrestricted execution of arbitrary C# are outside the initial scope.
+## Installation (Unity Package Manager)
 
-## Releases and development
+Add the package through a Git URL, pinned to the release tag:
 
-This repository is the intended public distribution destination. The Windows v1 development baseline is version **0.1.0** (`com.opweave.workflow`), mapped to the verified source commit in [release-lock.json](release-lock.json). The development repository is [OpWeave-dev](https://github.com/pippirium/OpWeave-dev) (private; not available to all visitors).
+1. Open **Window > Package Manager**.
+2. Choose **+ > Add package from git URL…**.
+3. Enter:
 
-**Verified development target:** Windows 11 x64, Unity 6000.5.11f1. OpWeave-authored materials are licensed under **[Apache License 2.0](LICENSE)**; see [licensing details](LICENSING.md) and [attribution](NOTICE). Third-party components retain their own licenses. The actual public Unity package, installation URL, release tag `v0.1.0` and GitHub Release are **not yet published**. The version record and license files are not a release announcement; publication still requires an audited transfer and separate release decision.
+   ```
+   https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.0
+   ```
+
+The package declares its dependencies (`com.unity.nuget.newtonsoft-json`, `com.unity.nuget.mono-cecil`) so they resolve automatically from the Unity registry.
+
+## Using OpWeave
+
+1. Create a workflow asset and open the OpWeave node editor.
+2. Search the operation catalog and place operation nodes; connect control-flow edges (execution order) and data ports (typed values).
+3. Save the graph; use **OpWeave > Save Graph JSON** to write the canonical workflow document.
+4. Run the workflow from the editor integration; execution waits for each operation's declared completion and reports per-step results and diagnostics.
+5. If a run is interrupted, recovery reconciles the journal into a reviewable state — uncertain states surface as needing review, never silent success.
+
+## Package structure
+
+| Path | Contents |
+| --- | --- |
+| `Editor/Core` | Canonical document model, compiler, execution runtime, registry, recovery, policy |
+| `Editor/Operations` | Built-in operation implementations |
+| `Editor/AgentApi` | Structured agent-facing API |
+| `Editor/GraphToolkit`, `Editor/Viewer` | Node editor and graph viewer UI |
+| `Editor/Pipeline`, `Editor/UnityAdapter` | Unity Pipeline and Unity-specific adapters |
+| `Editor/Testing` | Test support (test-only assembly) |
+| `Schemas~`, `Samples~`, `Editor/Templates~` | JSON schemas, sample workflows, templates (Unity-ignored folders) |
+| `Tests` | Package test assemblies and vendored test-only plugin binaries |
+
+## License
+
+OpWeave-authored code and documentation are licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE) and [LICENSING.md](LICENSING.md). Third-party components keep their own licenses — see [Third Party Notices](Packages/com.opweave.workflow/Third%20Party%20Notices.md), the test-plugin inventory `Packages/com.opweave.workflow/Tests/Plugins/THIRD_PARTY_NOTICES.txt`, and the license texts under `Tests/Plugins/Licenses/`.
+
+## Known limitations
+
+- **Windows-only.** macOS/Linux support is deferred past v1; running elsewhere is unsupported.
+- **Editor-time only.** Runtime/players and in-game visual scripting are out of scope.
+- Initial scope targets Unity Editor editing operations; unrestricted execution of arbitrary C# is outside the v1 contract.
+
+## Provenance
+
+Version `0.1.0` corresponds to the accepted Windows v1 development baseline recorded in [VERSION](VERSION) and [release-lock.json](release-lock.json) (source: private `pippirium/OpWeave-dev`; G-09 acceptance evidence referenced there). `0.1.0` identifies one immutable product payload; corrections ship under a later version, never a retargeted tag.

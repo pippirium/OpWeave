@@ -1,0 +1,31 @@
+{
+    "name": "OpWeave.Pipeline",
+    "rootNamespace": "OpWeave.Pipeline",
+    "references": [
+        "OpWeave.AgentApi",
+        "OpWeave.Core",
+        "Unity.Pipeline.Attributes",
+        "Unity.Pipeline"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "OPWEAVE_PIPELINE"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.pipeline",
+            "expression": "0.9.1-exp.1",
+            "define": "OPWEAVE_PIPELINE"
+        }
+    ],
+    "noEngineReferences": false
+}
