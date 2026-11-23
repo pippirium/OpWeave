@@ -22,4 +22,4 @@ OpWeave は、Unity Editor の操作を型付きのOperationとして検索・�
 
 このリポジトリは公開配布先です。Windows v1 は **`0.1.0`** (`com.opweave.workflow`) として固定し、検証済みの開発側コミットとの対応を [release-lock.json](release-lock.json) に記録しています。開発リポジトリ [OpWeave-dev](https://github.com/pippirium/OpWeave-dev) は非公開です。
 
-**検証済みの対象:** Windows 11 x64 / Unity 6000.5.11f1。公開パッケージ、インストール用URL、正式タグ `v0.1.0`、配布条件・ライセンス表示は **未公開** です。バージョンの記録だけで公開リリースが成立したことにはなりません。
+**検証済みの対象:** Windows 11 x64 / Unity 6000.5.11f1。OpWeave本体のライセンスは **[Apache License 2.0](LICENSE)** に確定しました。[適用範囲](LICENSING.md) と [著作権・帰属表示](NOTICE) を参照してください。第三者製品はそれぞれのライセンスが適用されます。公開用Unityパッケージ、インストール用URL、正式タグ `v0.1.0` とGitHub Releaseは **未公開** です。ライセンス確定とバージョン記録だけで公開リリースが成立したことにはなりません。
