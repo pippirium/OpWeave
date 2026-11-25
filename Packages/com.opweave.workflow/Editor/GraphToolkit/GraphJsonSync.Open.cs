@@ -594,11 +594,15 @@ namespace OpWeave.GraphToolkit
         }
 
         // T-W5.3-07's implementation of the ClearOpenTestState seam
-        // declared in GraphJsonSync.cs: the per-GUID instrumentation, the
-        // queued-but-undrained requests and the dedupe set are test state
-        // a fixture must not leak across tests — a leftover request must
-        // never drain into the next test's counters or show its prompt
-        // there.
+        // declared in GraphJsonSync.cs, completed for T-W5.3-16's
+        // isolation contract: the per-GUID instrumentation, the
+        // queued-but-undrained requests, the dedupe set, the live-graph
+        // registry and the installed choice provider are session state
+        // a fixture must not leak across runs — a leftover request must
+        // never drain into the next run's counters or show its prompt
+        // there, a stale live registration must never answer a lookup,
+        // and a scripted answer must never survive as the drain's
+        // prompt.
         static partial void ClearOpenTestState()
         {
             OpenCheckRequests.Clear();
@@ -609,6 +613,8 @@ namespace OpWeave.GraphToolkit
             OpenCheckDropReason.Clear();
             s_pendingOpenChecks.Clear();
             s_scheduledOpens.Clear();
+            s_live.Clear();
+            s_openChoiceProvider = null;
         }
     }
 }

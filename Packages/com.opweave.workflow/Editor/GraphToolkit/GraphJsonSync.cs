@@ -1813,9 +1813,20 @@ namespace OpWeave.GraphToolkit
             return intentPath + "|" + (warning ?? "");
         }
 
-        // Test-only reset: remembered §H7.3 decisions, the warn-once set
-        // and the probe seams are static state a fixture must not leak
-        // across tests.
+        // The single isolation seam of T-W5.3-16 (research B-05): the
+        // one internal reset entry point every mutable static the type
+        // carries funnels through — the remembered §H7.3 decisions, the
+        // warn-once and unsynced-notify sets, the queued and scheduled
+        // open checks, the per-GUID instrumentation, the live-graph
+        // registry, the installed open choice provider, every test-only
+        // fault hook and the dirty-mark reflection cache — so a
+        // domain-reload boundary and consecutive fixtures can never
+        // observe a previous run's state. The clear runs under the same
+        // single-threaded editor discipline every mutation of these
+        // seams uses; the remembered-decision map additionally keeps
+        // its own lock, which the clear honours. SyncSeamOccupancy is
+        // the matching inspection surface, and the T-W5.3-16 test's
+        // reflection census proves no static field escapes coverage.
         internal static void ClearSyncTestState()
         {
             lock (s_remembered)
@@ -1828,8 +1839,42 @@ namespace OpWeave.GraphToolkit
             PublishPersistFault = null;
             PersistFault = null;
             IntentRecordProbe = null;
+            GraphDirtyMark.Reset();
             ClearNotifyTestState();
             ClearOpenTestState();
+        }
+
+        // The inspectability half of the isolation contract (T-W5.3-16):
+        // one occupancy count per mutable static seam the type carries —
+        // a fixture asserts "populated" and "cleared" through this single
+        // view instead of reaching into private state, and the census
+        // keeps the table covering every seam the reset clears.
+        internal static IReadOnlyDictionary<string, int> SyncSeamOccupancy()
+        {
+            var seams = new Dictionary<string, int>(StringComparer.Ordinal);
+            lock (s_remembered)
+            {
+                seams["s_remembered"] = s_remembered.Count;
+            }
+            seams["s_warnedIntents"] = s_warnedIntents.Count;
+            seams["s_unsyncedNotified"] = s_unsyncedNotified.Count;
+            seams["PublishPersistFault"] = PublishPersistFault is null ? 0 : 1;
+            seams["AbsenceProbe"] = AbsenceProbe is null ? 0 : 1;
+            seams["PublishProbe"] = PublishProbe is null ? 0 : 1;
+            seams["PersistFault"] = PersistFault is null ? 0 : 1;
+            seams["IntentRecordProbe"] = IntentRecordProbe is null ? 0 : 1;
+            seams["GraphDirtyMark"] = GraphDirtyMark.Resolved ? 1 : 0;
+            seams["s_scheduledOpens"] = s_scheduledOpens.Count;
+            seams["s_live"] = s_live.Count;
+            seams["s_pendingOpenChecks"] = s_pendingOpenChecks.Count;
+            seams["OpenCheckRequests"] = OpenCheckRequests.Count;
+            seams["OpenChecksPerformed"] = OpenChecksPerformed.Count;
+            seams["OpenDialogsShown"] = OpenDialogsShown.Count;
+            seams["OpenEnableCount"] = OpenEnableCount.Count;
+            seams["OpenChecksDropped"] = OpenChecksDropped.Count;
+            seams["OpenCheckDropReason"] = OpenCheckDropReason.Count;
+            seams["s_openChoiceProvider"] = s_openChoiceProvider is null ? 0 : 1;
+            return seams;
         }
 
         private static string? SiblingPathOf(OpWeaveGraph graph)
@@ -1959,6 +2004,26 @@ namespace OpWeave.GraphToolkit
                     // A failed mark leaves the persist unwritten — the
                     // file proof keeps the pending intent standing.
                 }
+            }
+
+            // The occupancy read SyncSeamOccupancy performs: a private
+            // member's accessibility domain is its own type's program
+            // text, so the containing GraphJsonSync cannot reach
+            // s_resolved directly — the read is exposed on the nested
+            // class itself, internal so nothing outside GraphJsonSync
+            // gains a new surface.
+            internal static bool Resolved => s_resolved;
+
+            // The resolved-once cache is one of the type's static seams
+            // (T-W5.3-16): the shared reset clears it so a later run
+            // re-resolves rather than inheriting a previous run's world.
+            internal static void Reset()
+            {
+                s_implementation = null;
+                s_setGraphObjectDirty = null;
+                s_graphObject = null;
+                s_dirty = null;
+                s_resolved = false;
             }
 
             private static object? ModelOf(OpWeaveGraph graph)

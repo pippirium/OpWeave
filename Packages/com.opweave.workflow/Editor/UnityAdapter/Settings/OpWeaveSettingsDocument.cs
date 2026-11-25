@@ -475,7 +475,13 @@ namespace OpWeave.UnityAdapter
     /// <para>
     /// Saving also refuses — without touching the file — when the on-disk content
     /// changed between load and save, and writes atomically through a temporary
-    /// file so a failed write never truncates the settings file.
+    /// file so a failed write never truncates the settings file. A transient
+    /// external hold on the file or its replacement — an indexer or virus
+    /// scanner briefly holding one open — is retried within a bounded budget
+    /// before the write is reported <see cref="SettingsSaveStatus.WriteFailed"/>;
+    /// a hold that releases into changed, vanished or newly present content is
+    /// refused as <see cref="SettingsSaveStatus.ChangedExternally"/>, never
+    /// overwritten.
     /// </para>
     /// </remarks>
     public sealed class OpWeaveSettingsDocument
@@ -488,6 +494,20 @@ namespace OpWeave.UnityAdapter
             "debugLogging", "tickBudgetMs", "retainRuns", "retainMegabytes",
             "approvalTimeoutMinutes",
         });
+
+        // The bounded retry the save's write step runs on a transient external
+        // hold of the file or its temporary replacement (Issue #151: an
+        // indexer or virus scanner briefly holding one open). The first delay
+        // is SaveWriteRetryFirstDelayMilliseconds and doubles on each later
+        // failure, capped at SaveWriteRetryMaxDelayMilliseconds per delay; a
+        // further attempt runs only while the time since the first failed
+        // attempt plus the next delay stays within
+        // SaveWriteRetryBudgetMilliseconds, then the save fails closed.
+        private const int SaveWriteRetryFirstDelayMilliseconds = 50;
+        private const int SaveWriteRetryMaxDelayMilliseconds = 500;
+        private const int SaveWriteRetryBudgetMilliseconds = 2000;
+        private static readonly System.Diagnostics.Stopwatch s_saveRetryStopwatch =
+            System.Diagnostics.Stopwatch.StartNew();
 
         private enum FileReadState
         {
@@ -1760,14 +1780,74 @@ namespace OpWeave.UnityAdapter
                 {
                     Directory.CreateDirectory(directory);
                 }
-                File.WriteAllText(tempPath, text);
-                if (File.Exists(FilePath))
+                // Every write attempt rewrites the temporary replacement and
+                // re-proves the destination is still the loaded content, then
+                // replaces or moves atomically: a transient external hold is
+                // retried within the bounded budget, a hold that releases into
+                // changed or vanished content is refused rather than
+                // overwritten, and after an ERROR_UNABLE_TO_REMOVE_REPLACED
+                // (1175) the next attempt provably publishes fresh replacement
+                // bytes.
+                long firstFailureAt = -1;
+                var nextDelay = SaveWriteRetryFirstDelayMilliseconds;
+                for (var attempt = 1; ; attempt++)
                 {
-                    File.Replace(tempPath, FilePath, null);
-                }
-                else
-                {
-                    File.Move(tempPath, FilePath);
+                    try
+                    {
+                        if (attempt > 1 && !FileUnchanged())
+                        {
+                            TryDeleteFile(tempPath);
+                            return OpWeaveSettingsSaveOutcome.ChangedExternally();
+                        }
+                        File.WriteAllText(tempPath, text);
+                        var targetExists = File.Exists(FilePath);
+                        var simulated =
+                            SaveWriteStepProbe?.Invoke(tempPath, FilePath, targetExists);
+                        if (simulated is not null)
+                        {
+                            throw simulated;
+                        }
+                        if (targetExists)
+                        {
+                            File.Replace(tempPath, FilePath, null);
+                        }
+                        else
+                        {
+                            File.Move(tempPath, FilePath);
+                        }
+                        break;
+                    }
+                    catch (Exception e) when (IsTransientWriteFailure(e))
+                    {
+                        var now = SaveRetryClock();
+                        if (firstFailureAt < 0)
+                        {
+                            firstFailureAt = now;
+                        }
+                        if (now - firstFailureAt + nextDelay >
+                            SaveWriteRetryBudgetMilliseconds)
+                        {
+                            throw;
+                        }
+                        SaveRetrySleep(nextDelay);
+                        nextDelay = Math.Min(
+                            nextDelay * 2, SaveWriteRetryMaxDelayMilliseconds);
+                    }
+                    catch (Exception e) when (
+                        e is FileNotFoundException ||
+                        e is DirectoryNotFoundException ||
+                        IsAlreadyExists(e))
+                    {
+                        // The destination or its directory vanished, or a
+                        // destination appeared, between the re-verification
+                        // and the write — the on-disk change the save refuses
+                        // on. A vanished temp, or a destination that is
+                        // provably still the loaded content, is a write fault.
+                        TryDeleteFile(tempPath);
+                        return FileUnchanged()
+                            ? OpWeaveSettingsSaveOutcome.WriteFailure(e.GetType().Name)
+                            : OpWeaveSettingsSaveOutcome.ChangedExternally();
+                    }
                 }
             }
             catch (Exception ex) when (
@@ -1792,6 +1872,22 @@ namespace OpWeave.UnityAdapter
             _original = (JObject)_working.DeepClone();
             return OpWeaveSettingsSaveOutcome.Saved(OpWeaveSettingsLoader.Parse(text));
         }
+
+        // Internal test seams for the bounded retry of the save's write step:
+        // SaveWriteStepProbe is invoked on every attempt with (temp path,
+        // target path, target exists); a non-null return is thrown instead of
+        // the real write step, so tests inject a transient failure
+        // deterministically. SaveRetryClock is the clock the retry budget
+        // measures elapsed time against and SaveRetrySleep the delay primitive
+        // it waits through; tests substitute a fake clock and a fake delay —
+        // typically one that advances it — so the budget is exercised quickly
+        // and deterministically. Production callers leave them at their
+        // defaults.
+        internal Func<string, string, bool, Exception?>? SaveWriteStepProbe { get; set; }
+        internal Func<long> SaveRetryClock { get; set; } =
+            () => s_saveRetryStopwatch.ElapsedMilliseconds;
+        internal Action<int> SaveRetrySleep { get; set; } =
+            System.Threading.Thread.Sleep;
 
         /// <summary>
         /// The exact file text a <see cref="Save"/> of a missing file writes —
@@ -2020,6 +2116,64 @@ namespace OpWeave.UnityAdapter
                 ex is System.Security.SecurityException || ex is NotSupportedException)
             {
             }
+        }
+
+        // The transient write failures the bounded retry absorbs: a sharing
+        // violation (Win32 error 32), a lock violation (33), access denied on
+        // a held target (5) or a replaced file that could not be removed
+        // (1175, ERROR_UNABLE_TO_REMOVE_REPLACED — whose retry rewrites the
+        // replacement file, so the next attempt provably publishes the
+        // intended bytes). An IOException carries its Win32 error in the low
+        // word of its HResult under FACILITY_WIN32 (0x8007xxxx) or as a bare
+        // Win32 code (0x0000xxxx); a matching low word under any other
+        // facility is not a Win32 error and is never retried. Error 5 also
+        // reaches File.Replace as an UnauthorizedAccessException with HResult
+        // 0x80070005 — COR_E_UNAUTHORIZEDACCESS shares that value, so an
+        // UnauthorizedAccessException is transient exactly then. Every other
+        // failure — including errors 1176 and 1177
+        // (ERROR_UNABLE_TO_MOVE_REPLACEMENT[2]), which can leave the
+        // destination removed, renamed or carrying merged streams — is not
+        // retried.
+        internal static bool IsTransientWriteFailure(Exception e)
+        {
+            if (e is UnauthorizedAccessException)
+            {
+                return e.HResult == unchecked((int)0x80070005);
+            }
+            if (e is IOException io)
+            {
+                var code = Win32ErrorCode(io.HResult);
+                return code == 0x20 || code == 0x21 || code == 0x05 || code == 0x0497;
+            }
+            return false;
+        }
+
+        // ERROR_FILE_EXISTS (80) / ERROR_ALREADY_EXISTS (183): a File.Move
+        // found a destination that appeared since the re-verification — the
+        // external change the save refuses on, not a write fault.
+        private static bool IsAlreadyExists(Exception e)
+        {
+            if (e is not IOException io)
+            {
+                return false;
+            }
+            var code = Win32ErrorCode(io.HResult);
+            return code == 0x50 || code == 0xB7;
+        }
+
+        // The Win32 error an IOException's HResult encodes: the low word when
+        // the facility is FACILITY_WIN32 (0x8007xxxx) or the HResult is a bare
+        // Win32 code (0x0000xxxx, the form new IOException(message, code)
+        // stores); -1 under any other facility, where a matching low word is
+        // not a Win32 error.
+        private static int Win32ErrorCode(int hresult)
+        {
+            var facility = hresult & unchecked((int)0xFFFF0000);
+            if (facility != unchecked((int)0x80070000) && facility != 0)
+            {
+                return -1;
+            }
+            return hresult & 0xFFFF;
         }
 
         private JArray? WhitelistArray(SettingsWhitelistKind kind) =>

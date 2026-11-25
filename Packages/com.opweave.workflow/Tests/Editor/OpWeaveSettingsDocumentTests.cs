@@ -2087,6 +2087,10 @@ namespace OpWeave.UnityAdapter.Tests
             try
             {
                 var document = OpWeaveSettingsDocument.Load(path);
+                // The held destination is retried inside the bounded budget
+                // before the save fails closed; the fake clock keeps the
+                // waits instant.
+                FakeRetryClock(document, new List<int>());
                 var outcome = document.Save();
 
                 Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.WriteFailed));
@@ -2101,6 +2105,323 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 File.SetAttributes(path, FileAttributes.Normal);
             }
+        }
+
+        // ── T-W3.4-05: bounded retry of a transient write hold (Issue #151) ──
+        // A transient external hold on the file or its temporary replacement —
+        // an indexer or virus scanner briefly holding one open — is retried
+        // inside the bounded budget; every attempt re-proves the destination
+        // against the loaded content and rewrites the replacement, a hold that
+        // releases into changed or vanished content is refused, and a
+        // persistent or non-transient failure still returns WriteFailed. The
+        // write-step probe makes every failure deterministic; on the pre-fix
+        // implementation the first injected hold surfaced WriteFailed.
+
+        // A fake retry clock/sleep pair: the sleep records each delay and
+        // advances the clock, so the budget is exercised instantly and the
+        // backoff sequence is asserted exactly.
+        private static void FakeRetryClock(
+            OpWeaveSettingsDocument document, List<int> delays)
+        {
+            long now = 0;
+            document.SaveRetryClock = () => now;
+            document.SaveRetrySleep = delay =>
+            {
+                delays.Add(delay);
+                now += delay;
+            };
+        }
+
+        [Test]
+        public void TransientWriteFailureClassification()
+        {
+            var transient = new Exception[]
+            {
+                new IOException("sharing violation", unchecked((int)0x80070020)),
+                new IOException("lock violation", unchecked((int)0x80070021)),
+                new IOException("access denied", unchecked((int)0x80070005)),
+                new IOException(
+                    "unable to remove replaced", unchecked((int)0x80070497)),
+                // The same Win32 errors as bare codes (0x0000xxxx), the
+                // form new IOException(message, code) stores.
+                new IOException("bare sharing violation", 0x20),
+                new IOException("bare lock violation", 0x21),
+                new IOException("bare access denied", 0x05),
+                new IOException("bare unable to remove replaced", 0x497),
+                // COR_E_UNAUTHORIZEDACCESS shares the Win32 access-denied
+                // HResult: File.Replace surfaces a held target either way.
+                new UnauthorizedAccessException(),
+            };
+            foreach (var e in transient)
+            {
+                Assert.IsTrue(
+                    OpWeaveSettingsDocument.IsTransientWriteFailure(e),
+                    e.GetType().Name + " (HResult 0x" +
+                    e.HResult.ToString("X8") + ") must be transient");
+            }
+
+            var notTransient = new Exception[]
+            {
+                // ERROR_UNABLE_TO_MOVE_REPLACEMENT[2] (1176/1177) can leave
+                // the destination removed or renamed — never retried.
+                new IOException(
+                    "unable to move replacement", unchecked((int)0x80070498)),
+                new IOException(
+                    "unable to move replacement 2", unchecked((int)0x80070499)),
+                new IOException("disk full", unchecked((int)0x80070070)),
+                new IOException("already exists", unchecked((int)0x800700B7)),
+                new FileNotFoundException("file not found"),
+                new DirectoryNotFoundException("directory not found"),
+                new IOException("no win32 code"),
+                // A Win32 error's low word under a non-Win32 facility is
+                // not a Win32 error: 32, 33, 5 and 1175 under FACILITY_ITF
+                // (0x8004xxxx) are not transient.
+                new IOException("itf 32", unchecked((int)0x80040020)),
+                new IOException("itf 33", unchecked((int)0x80040021)),
+                new IOException("itf 5", unchecked((int)0x80040005)),
+                new IOException("itf 1175", unchecked((int)0x80040497)),
+            };
+            foreach (var e in notTransient)
+            {
+                Assert.IsFalse(
+                    OpWeaveSettingsDocument.IsTransientWriteFailure(e),
+                    e.GetType().Name + " (HResult 0x" +
+                    e.HResult.ToString("X8") + ") must not be retried");
+            }
+        }
+
+        [TestCase(0x20)]
+        [TestCase(0x21)]
+        [TestCase(0x05)]
+        [TestCase(0x497)]
+        public void TransientWriteHoldRetriesAndSaves(int win32Error)
+        {
+            var path = WriteFixture("{\"version\":2,\"debugLogging\":null}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            document.SetInteger(SettingsIntegerKey.TickBudgetMs, 16);
+            var delays = new List<int>();
+            FakeRetryClock(document, delays);
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                Assert.IsTrue(targetExists);
+                return attempts++ == 0
+                    ? new IOException(
+                        "simulated hold",
+                        unchecked((int)0x80070000) | win32Error)
+                    : null;
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.Saved),
+                "a hold released within the budget saves");
+            Assert.That(attempts, Is.EqualTo(2),
+                "the transient hold is retried exactly once");
+            Assert.That(delays, Is.EqualTo(new[] { 50 }),
+                "the first retry waits the first backoff delay");
+            Assert.That(SavedRoot(path)["debugLogging"]!.Type,
+                Is.EqualTo(JTokenType.Null),
+                "the explicit null is still written back verbatim");
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"),
+                "the temporary replacement is cleaned up");
+        }
+
+        [Test]
+        public void TransientAccessDeniedRetriesAndSaves()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            var delays = new List<int>();
+            FakeRetryClock(document, delays);
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+                attempts++ == 0 ? new UnauthorizedAccessException() : (Exception?)null;
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.Saved));
+            Assert.That(attempts, Is.EqualTo(2));
+            Assert.That(delays, Is.EqualTo(new[] { 50 }));
+        }
+
+        [Test]
+        public void TransientHoldOnMissingFileRetriesAndSaves()
+        {
+            var path = Path.Combine(_dir, "created", "OpWeaveSettings.json");
+            var document = OpWeaveSettingsDocument.Load(path);
+            Assert.IsFalse(document.FileExists);
+            var delays = new List<int>();
+            FakeRetryClock(document, delays);
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                Assert.IsFalse(targetExists);
+                return attempts++ == 0
+                    ? new IOException("simulated hold", unchecked((int)0x80070020))
+                    : null;
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.Saved),
+                "a transient hold on the create path is retried too");
+            Assert.That(attempts, Is.EqualTo(2));
+            Assert.That(delays, Is.EqualTo(new[] { 50 }));
+            Assert.IsTrue(File.Exists(path));
+            var reloaded = Reload(path);
+            Assert.IsTrue(reloaded.Ok);
+            Assert.That(reloaded.Value!.RetainRuns, Is.EqualTo(50));
+        }
+
+        [Test]
+        public void TransientHoldReleasingIntoExternalChangeIsRefused()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            FakeRetryClock(document, new List<int>());
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                attempts++;
+                File.WriteAllText(target, "{\"version\":2,\"future\":1}");
+                return new IOException("simulated hold", unchecked((int)0x80070020));
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status,
+                Is.EqualTo(SettingsSaveStatus.ChangedExternally),
+                "a hold that releases into new content is refused, not overwritten");
+            Assert.That(VersionText(path),
+                Is.EqualTo("{\"version\":2,\"future\":1}"),
+                "the external bytes are left untouched");
+            Assert.That(attempts, Is.EqualTo(1),
+                "the second attempt refuses at re-verification, before the seam");
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
+        }
+
+        [Test]
+        public void TransientHoldReleasingIntoDeletionIsRefused()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            FakeRetryClock(document, new List<int>());
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                attempts++;
+                File.Delete(target);
+                return new IOException("simulated hold", unchecked((int)0x80070020));
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status,
+                Is.EqualTo(SettingsSaveStatus.ChangedExternally));
+            Assert.IsFalse(File.Exists(path),
+                "the vanished destination is never recreated");
+            Assert.That(attempts, Is.EqualTo(1),
+                "the second attempt refuses at re-verification, before the seam");
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
+        }
+
+        [Test]
+        public void PersistentWriteHoldFailsClosedAfterBudget()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            var delays = new List<int>();
+            FakeRetryClock(document, delays);
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                attempts++;
+                return new IOException("simulated hold", unchecked((int)0x80070020));
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.WriteFailed),
+                "a hold that never releases fails closed once the budget is used up");
+            Assert.That(outcome.FailureMessage, Is.Not.Null.And.Not.Empty);
+            Assert.That(outcome.ExceptionTypeName, Is.EqualTo("IOException"));
+            Assert.That(attempts, Is.EqualTo(7),
+                "seven attempts fit inside the 2000 ms budget");
+            Assert.That(delays,
+                Is.EqualTo(new[] { 50, 100, 200, 400, 500, 500 }),
+                "the backoff doubles from 50 ms, caps at 500 ms per delay " +
+                "and stays within the 2000 ms budget");
+            Assert.That(VersionText(path), Is.EqualTo("{\"version\":2}"),
+                "the destination's bytes are unchanged");
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
+        }
+
+        [Test]
+        public void NonTransientWriteFailureIsNotRetried()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            var delays = new List<int>();
+            FakeRetryClock(document, delays);
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                attempts++;
+                return new IOException("disk full", unchecked((int)0x80070070));
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.WriteFailed),
+                "a genuine write error is never retried into a false success");
+            Assert.That(attempts, Is.EqualTo(1));
+            Assert.IsEmpty(delays, "no retry delay was slept");
+            Assert.That(VersionText(path), Is.EqualTo("{\"version\":2}"));
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
+        }
+
+        [Test]
+        public void DestinationVanishedAtWriteIsChangedExternally()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            FakeRetryClock(document, new List<int>());
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                File.Delete(target);
+                return (Exception?)new FileNotFoundException("simulated vanish");
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status,
+                Is.EqualTo(SettingsSaveStatus.ChangedExternally),
+                "a destination that vanished before the write is refused");
+            Assert.IsFalse(File.Exists(path));
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
+        }
+
+        [Test]
+        public void ReplacementVanishedAtWriteIsWriteFailed()
+        {
+            var path = WriteFixture("{\"version\":2}");
+            var document = OpWeaveSettingsDocument.Load(path);
+            FakeRetryClock(document, new List<int>());
+            var attempts = 0;
+            document.SaveWriteStepProbe = (temp, target, targetExists) =>
+            {
+                attempts++;
+                return (Exception?)new FileNotFoundException("simulated temp loss");
+            };
+
+            var outcome = document.Save();
+
+            Assert.That(outcome.Status, Is.EqualTo(SettingsSaveStatus.WriteFailed),
+                "the destination is provably unchanged, so the loss is a write fault");
+            Assert.That(attempts, Is.EqualTo(1));
+            Assert.That(VersionText(path), Is.EqualTo("{\"version\":2}"));
+            Assert.IsEmpty(Directory.GetFiles(_dir, "*.tmp"));
         }
     }
 }

@@ -6,6 +6,11 @@
 // records. The two-process cases drive the OpWeave.LockSmoke helper's
 // json-* modes over the product coordinator, exactly like the
 // CoordinatorRunLock smokes.
+//
+// T-W4.6-11 (Issue #400): the lock namespace is the canonical resolved
+// target alone — overlapping project roots addressing one physical file
+// share one exclusion, distinct files never share, and an unplaceable
+// lock still fails closed.
 
 using System;
 using System.Collections.Generic;
@@ -119,7 +124,7 @@ namespace OpWeave.Core.Tests
             using (first.Lock!)
             {
                 Assert.IsTrue(File.Exists(lockPath),
-                    "the lock file exists under Library/OpWeave/locks");
+                    "the lock file exists beside the target");
 
                 var result = Path.Combine(root, "racer.result");
                 var waited = Stopwatch.StartNew();
@@ -230,6 +235,158 @@ namespace OpWeave.Core.Tests
             Assert.AreEqual("acquired",
                 LockSmokeHarness.WaitSignalFile(after, survivor).Trim(),
                 "the OS released the dead process's handle");
+        }
+
+        // T-W4.6-11 (Issue #400): a Unity project nested inside another
+        // project's directory means two coordinators with different project
+        // roots can legitimately resolve one physical file — the lock
+        // namespace must be the canonical target alone, so both roots
+        // derive the same lock file and the exclusion is mutual.
+        [Test]
+        public void LockPath_OverlappingRoots_ShareOneNamespace()
+        {
+            var outer = NewProjectRoot();
+            var inner = Path.Combine(outer, "nested", "InnerProject");
+            var target = TargetIn(inner, "shared.opweave.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.WriteAllText(target, "{}");
+
+            var outerCoordinator = new JsonSaveCoordinator(outer);
+            var innerCoordinator = new JsonSaveCoordinator(inner);
+            var outerResolved = outerCoordinator.ResolveOwnedPath(target);
+            var innerResolved = innerCoordinator.ResolveOwnedPath(target);
+            Assert.AreEqual(PathResolveStatus.Resolved, outerResolved.Status,
+                "the outer root owns the nested file too");
+            Assert.AreEqual(PathResolveStatus.Resolved, innerResolved.Status);
+            Assert.AreEqual(outerResolved.ResolvedPath, innerResolved.ResolvedPath,
+                "both roots resolve one canonical path");
+
+            var outerLockPath = outerCoordinator.LockPathFor(outerResolved.ResolvedPath!);
+            var innerLockPath = innerCoordinator.LockPathFor(innerResolved.ResolvedPath!);
+            Assert.AreEqual(outerLockPath, innerLockPath,
+                "one canonical file means one lock namespace across overlapping roots");
+            Assert.AreEqual(
+                Path.Combine(Path.GetDirectoryName(outerResolved.ResolvedPath!)!,
+                    ".opweave-locks"),
+                Path.GetDirectoryName(outerLockPath),
+                "the lock file sits beside the canonical target, under no project root");
+        }
+
+        [Test]
+        [Platform("Win")]
+        public void Acquire_OverlappingRoots_MutualExclusion()
+        {
+            var helper = LockSmokeHarness.BuildHelper();
+            var outer = NewProjectRoot();
+            var inner = Path.Combine(outer, "nested", "InnerProject");
+            var target = TargetIn(inner, "overlap.opweave.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.WriteAllText(target, "{}");
+            var coordinator = new JsonSaveCoordinator(outer);
+            var resolved = coordinator.ResolveOwnedPath(target).ResolvedPath!;
+
+            var held = coordinator.TryAcquire(resolved);
+            Assert.AreEqual(AcquireStatus.Acquired, held.Status);
+            using (held.Lock!)
+            {
+                // A second process rooted at the INNER project addresses the
+                // same physical file: one lock namespace means it contends,
+                // waits the bounded window and reports Busy.
+                var result = Path.Combine(outer, "inner-racer.result");
+                var waited = Stopwatch.StartNew();
+                var racer = LockSmokeHarness.SpawnHelper(
+                    helper,
+                    "json-try \"" + inner + "\" \"" + target + "\" \"" + result + "\"",
+                    null, _children);
+                var outcome = LockSmokeHarness.WaitSignalFile(result, racer);
+                waited.Stop();
+                Assert.AreEqual("busy", outcome.Trim(),
+                    "the inner-rooted process shares the held lock's namespace");
+                Assert.GreaterOrEqual(waited.ElapsedMilliseconds, 1500,
+                    "the contended acquisition waited before reporting Busy");
+            }
+
+            // The other direction: a second process rooted at the inner
+            // project holds the lock; the outer-rooted coordinator is
+            // refused — the exclusion is mutual, not one-sided.
+            var ready = Path.Combine(outer, "inner-holder.ready");
+            var holder = LockSmokeHarness.SpawnHelper(
+                helper,
+                "json-hold \"" + inner + "\" \"" + target + "\" \"" + ready + "\"",
+                ready + ".stop", _children);
+            var signal = LockSmokeHarness.WaitSignalFile(ready, holder);
+            StringAssert.StartsWith("holding", signal);
+            var busy = coordinator.TryAcquire(resolved, 500);
+            Assert.AreEqual(AcquireStatus.Busy, busy.Status,
+                "a lock held under the inner root excludes the outer root");
+            File.WriteAllText(ready + ".stop", "stop");
+            Assert.IsTrue(holder.Process.WaitForExit(15000));
+
+            // Released: the inner-rooted process acquires again.
+            var after = Path.Combine(outer, "after.result");
+            var third = LockSmokeHarness.SpawnHelper(
+                helper,
+                "json-try \"" + inner + "\" \"" + target + "\" \"" + after + "\"",
+                null, _children);
+            Assert.AreEqual("acquired",
+                LockSmokeHarness.WaitSignalFile(after, third).Trim(),
+                "the lock frees after the holder releases it");
+        }
+
+        // Distinct canonical paths never share a lock namespace: a held
+        // lock on one file never contends a sibling's acquisition.
+        [Test]
+        [Platform("Win")]
+        public void Acquire_DistinctFiles_NoFalseSharing()
+        {
+            var root = NewProjectRoot();
+            var targetA = TargetIn(root, "first.opweave.json");
+            var targetB = TargetIn(root, "second.opweave.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(targetA)!);
+            File.WriteAllText(targetA, "{}");
+            File.WriteAllText(targetB, "{}");
+            var coordinator = new JsonSaveCoordinator(root);
+            var resolvedA = coordinator.ResolveOwnedPath(targetA).ResolvedPath!;
+            var resolvedB = coordinator.ResolveOwnedPath(targetB).ResolvedPath!;
+
+            Assert.AreNotEqual(
+                coordinator.LockPathFor(resolvedA),
+                coordinator.LockPathFor(resolvedB),
+                "distinct files never share a lock namespace");
+
+            var first = coordinator.TryAcquire(resolvedA);
+            Assert.AreEqual(AcquireStatus.Acquired, first.Status);
+            using (first.Lock!)
+            {
+                var second = coordinator.TryAcquire(resolvedB, 250);
+                Assert.AreEqual(AcquireStatus.Acquired, second.Status,
+                    "a held lock on one file never contends a sibling");
+                second.Lock!.Dispose();
+            }
+        }
+
+        // The lock namespace's directory cannot be placed — a plain file
+        // already sits where .opweave-locks must be created: acquisition
+        // fails closed, never degrading to an unlocked write.
+        [Test]
+        public void Acquire_LockNamespaceBlocked_FailsClosed()
+        {
+            var root = NewProjectRoot();
+            var target = TargetIn(root, "blocked.opweave.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.WriteAllText(target, "{}");
+            var coordinator = new JsonSaveCoordinator(root);
+            var resolved = coordinator.ResolveOwnedPath(target).ResolvedPath!;
+            var lockPath = coordinator.LockPathFor(resolved);
+
+            File.WriteAllText(Path.GetDirectoryName(lockPath)!, "not a directory");
+            var result = coordinator.TryAcquire(resolved, 500);
+            Assert.AreEqual(AcquireStatus.IoError, result.Status,
+                "an unplaceable lock namespace fails closed");
+            Assert.IsNull(result.Lock,
+                "no exclusion means no write lease");
+            Assert.IsFalse(File.Exists(lockPath),
+                "no lock file was created");
         }
 
         // SPEC §E2 item 3 / §H7 item 3 (decision D, T-W4.6-08): the same

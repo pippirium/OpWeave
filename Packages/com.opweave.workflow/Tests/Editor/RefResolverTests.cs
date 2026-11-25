@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using OpWeave.Core;
+using OpWeave.Operations;
 using OpWeave.UnityAdapter;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -1120,6 +1121,142 @@ namespace OpWeave.UnityAdapter.Tests
                 () => _resolver.ToRef(go, "unity.PrefabAssetRef"));
             Assert.Throws<ArgumentException>(
                 () => _resolver.ToRef(go, "unity.PrefabInstanceRef"));
+        }
+
+        // ── T-W2.3-07 / Issue #300: Editor fake-null ─────────────────────
+        // A destroyed-but-referenced UnityEngine.Object is Editor
+        // fake-null: `is null` misses it where `== null` catches it, so a
+        // null-pattern check treats the dead object as live. Every site the
+        // resolver or the evidence helpers intend as "missing" must read a
+        // destroyed object as absent.
+
+        [Test]
+        public void GameObjectRef_DestroyedHandleTarget_IsUnity001()
+        {
+            var go = Go("G2Doomed");
+            var handle = SessionHandle.Write(go);
+            UnityEngine.Object.DestroyImmediate(go);
+            var result = _resolver.Resolve<GameObject>(RefOf(new JObject
+            {
+                ["kind"] = "gameObject",
+                ["handle"] = handle,
+            }));
+            Assert.IsFalse(result.Ok);
+            Assert.That(CodeOf(result), Is.EqualTo(ErrorCodes.OW_UNITY_001));
+        }
+
+        [Test]
+        public void GameObjectRef_DestroyedGlobalIdTarget_IsUnity001()
+        {
+            var scene = OpenSavedScene(SceneProbePath);
+            var go = GoInScene("G2Doomed", scene);
+            var globalId = GlobalObjectId.GetGlobalObjectIdSlow(go).ToString();
+            Assert.IsTrue(GlobalObjectId.TryParse(globalId, out _),
+                "a saved-scene object must have a stable globalId");
+            UnityEngine.Object.DestroyImmediate(go);
+            var result = _resolver.Resolve<GameObject>(RefOf(new JObject
+            {
+                ["kind"] = "gameObject",
+                ["globalId"] = globalId,
+            }));
+            Assert.IsFalse(result.Ok);
+            Assert.That(CodeOf(result), Is.EqualTo(ErrorCodes.OW_UNITY_001));
+        }
+
+        [Test]
+        public void ComponentRef_DestroyedComponentSlot_IsUnity001()
+        {
+            var go = Go("G2Owner");
+            var animator = go.AddComponent<Animator>();
+            UnityEngine.Object.DestroyImmediate(animator);
+            var result = _resolver.Resolve<Animator>(RefOf(new JObject
+            {
+                ["kind"] = "component",
+                ["owner"] = new JObject
+                {
+                    ["kind"] = "gameObject",
+                    ["handle"] = SessionHandle.Write(go),
+                },
+                ["type"] = "unity.Animator",
+                ["index"] = 0,
+            }));
+            Assert.IsFalse(result.Ok);
+            Assert.That(CodeOf(result), Is.EqualTo(ErrorCodes.OW_UNITY_001));
+        }
+
+        [Test]
+        public void PrefabContentsRef_DestroyedContentsRoot_IsUnity003()
+        {
+            var doomed = Go("G2DoomedContents");
+            var resolver = new RefResolver(_ => doomed);
+            UnityEngine.Object.DestroyImmediate(doomed);
+            // The Run-resource lookup still hands back the destroyed
+            // contents root — a fake-null the resolver must read as absent.
+            var result = resolver.Resolve<GameObject>(RefOf(new JObject
+            {
+                ["kind"] = "gameObject",
+                ["scene"] = "prefab-contents:0123456789abcdef0123456789abcdef",
+                ["path"] = "/G2DoomedContents",
+            }));
+            Assert.IsFalse(result.Ok);
+            Assert.That(CodeOf(result), Is.EqualTo(ErrorCodes.OW_UNITY_003));
+        }
+
+        [Test]
+        public void PrefabContentsRef_DestroyedContentsRoot_SceneKeyIsUnity003()
+        {
+            var live = Go("G2Outside");
+            var doomed = Go("G2DoomedContents");
+            var resolver = new RefResolver(_ => doomed);
+            UnityEngine.Object.DestroyImmediate(doomed);
+            // The handle resolves a live object outside every contents
+            // resource; the scene key names a registered resource whose
+            // recorded root is now destroyed — unverifiable, OW-UNITY-003.
+            var result = resolver.Resolve<GameObject>(RefOf(new JObject
+            {
+                ["kind"] = "gameObject",
+                ["handle"] = SessionHandle.Write(live),
+                ["scene"] = "prefab-contents:0123456789abcdef0123456789abcdef",
+            }));
+            Assert.IsFalse(result.Ok);
+            Assert.That(CodeOf(result), Is.EqualTo(ErrorCodes.OW_UNITY_003));
+        }
+
+        [Test]
+        public void ToRef_DestroyedObject_ThrowsArgumentNull()
+        {
+            var go = Go("G2Doomed");
+            UnityEngine.Object.DestroyImmediate(go);
+            Assert.Throws<ArgumentNullException>(
+                () => _resolver.ToRef(go, "unity.GameObjectRef"));
+        }
+
+        [Test]
+        public void LiveChildren_DestroyedParent_ReportsSceneRoots()
+        {
+            var parent = Go("G2DoomedParent");
+            Go("G2DoomedChild", parent);
+            var scene = parent.scene;
+            var parentTransform = parent.transform;
+            UnityEngine.Object.DestroyImmediate(parent);
+            // A destroyed parent transform is absent evidence — the check
+            // falls back to the scene's root list, never dereferences it.
+            var children = GameObjectEvidence.LiveChildren(parentTransform, scene);
+            CollectionAssert.AreEqual(scene.GetRootGameObjects(), children);
+        }
+
+        [Test]
+        public void ComponentsMatch_DestroyedPrimitiveCollider_FailsClosed()
+        {
+            var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            _created.Add(cube);
+            UnityEngine.Object.DestroyImmediate(cube.GetComponent<BoxCollider>());
+            // The dead collider slot is unverifiable: the content check
+            // fails closed instead of treating fake-null as a live collider.
+            var matches = GameObjectEvidence.ComponentsMatch(
+                cube, "cube", out var reason);
+            Assert.IsFalse(matches);
+            Assert.That(reason, Is.EqualTo("component list differs"));
         }
     }
 }

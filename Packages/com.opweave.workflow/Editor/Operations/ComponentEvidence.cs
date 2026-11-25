@@ -30,6 +30,13 @@ namespace OpWeave.Operations
     /// </remarks>
     internal static class ComponentEvidence
     {
+        /// <summary>The marker recorded in place of a full
+        /// <see cref="Entry"/> for a dead component slot — a missing
+        /// script. It is evidence of shape, not of inspected content:
+        /// unverifiable, so two identical markers can never prove the
+        /// components identical (fail closed, Issue #313).</summary>
+        internal const string MissingComponentMarker = "<missing>";
+
         /// <summary>One ordered component entry: the class-id of the
         /// component's exact type, its session handle and its normalized
         /// serialized content — the "型・順序・handle" evidence plus the
@@ -50,6 +57,21 @@ namespace OpWeave.Operations
             }
             return entry;
         }
+
+        /// <summary>
+        /// Whether a recorded component entry is fully inspectable —
+        /// the exact-type class-id, a readable session handle and the
+        /// normalized <c>content</c> of a complete <see cref="Entry"/>.
+        /// The <see cref="MissingComponentMarker"/> entry and an entry
+        /// whose content could not be normalized are both unverifiable:
+        /// two identical markers still prove nothing, so a comparison
+        /// must treat them as unequal (fail closed, Issue #313).
+        /// </summary>
+        internal static bool IsVerifiableEntry(JToken? entry) =>
+            entry is JObject obj &&
+            obj["type"] is JValue { Type: JTokenType.String } &&
+            HandleOf(obj) is not null &&
+            obj["content"] is JObject;
 
         /// <summary>
         /// Normalizes a component's serialized content the way
@@ -97,13 +119,18 @@ namespace OpWeave.Operations
 
         /// <summary>The ordered component entries of a GameObject, in
         /// <c>GetComponents</c> order — the "所有 GameObject の Component の
-        /// 一覧" both rows record.</summary>
+        /// 一覧" both rows record. A dead (missing script) slot records
+        /// the <see cref="MissingComponentMarker"/> marker instead of a
+        /// full <see cref="Entry"/> — unverifiable evidence that never
+        /// proves the list unchanged (fail closed).</summary>
         internal static JArray ComponentsOf(GameObject owner)
         {
             var components = new JArray();
             foreach (var component in LiveComponents(owner))
             {
-                components.Add(Entry(component));
+                components.Add(component == null
+                    ? new JObject { ["type"] = MissingComponentMarker }
+                    : Entry(component));
             }
             return components;
         }
@@ -135,10 +162,16 @@ namespace OpWeave.Operations
         /// </summary>
         internal static bool SameComponent(JToken? snapshotEntry, Component live)
         {
-            if (snapshotEntry is not JObject entry || HandleOf(entry) is not { } raw)
+            // An uninspectable entry — a "<missing>" marker or one
+            // without normalized content — and a dead live slot are
+            // unverifiable, never "the same component" (fail closed,
+            // Issue #313).
+            if (live == null || !IsVerifiableEntry(snapshotEntry) ||
+                HandleOf(snapshotEntry) is not { } raw)
             {
                 return false;
             }
+            var entry = (JObject)snapshotEntry!;
             if (SessionHandle.RawOf(live) != raw)
             {
                 return false;

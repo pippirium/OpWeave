@@ -110,7 +110,7 @@ namespace OpWeave.Operations
             Transform? parent, Scene scene)
         {
             var children = new List<GameObject>();
-            if (parent is not null)
+            if (parent != null)
             {
                 for (var i = 0; i < parent.childCount; i++)
                 {
@@ -308,7 +308,7 @@ namespace OpWeave.Operations
             var names = new string[components.Length];
             for (var i = 0; i < components.Length; i++)
             {
-                names[i] = components[i] is null ? "<missing>" : components[i].GetType().Name;
+                names[i] = components[i] == null ? "<missing>" : components[i].GetType().Name;
             }
             return names;
         }
@@ -401,15 +401,14 @@ namespace OpWeave.Operations
                 return true;
             }
             var builtin = Resources.GetBuiltinResource<Mesh>(meshName + ".fbx");
-            if (builtin is null)
+            if (builtin == null)
             {
                 reason = "the built-in primitive mesh could not be loaded";
                 return false;
             }
-            var mesh = go.GetComponent<MeshFilter>() is { } filter
-                ? filter.sharedMesh
-                : null;
-            if (mesh is null || mesh != builtin)
+            var filter = go.GetComponent<MeshFilter>();
+            var mesh = filter != null ? filter.sharedMesh : null;
+            if (mesh == null || mesh != builtin)
             {
                 reason = "mesh does not match the built-in primitive";
                 return false;
@@ -419,7 +418,7 @@ namespace OpWeave.Operations
                 case "cube":
                 {
                     var box = go.GetComponent<BoxCollider>();
-                    if (box is null ||
+                    if (box == null ||
                         !SameVector(box.center, Vector3.zero) ||
                         !SameVector(box.size, Vector3.one))
                     {
@@ -431,7 +430,7 @@ namespace OpWeave.Operations
                 case "sphere":
                 {
                     var sphere = go.GetComponent<SphereCollider>();
-                    if (sphere is null ||
+                    if (sphere == null ||
                         !SameVector(sphere.center, Vector3.zero) ||
                         !Mathf.Approximately(sphere.radius, 0.5f))
                     {
@@ -444,7 +443,7 @@ namespace OpWeave.Operations
                 case "cylinder":
                 {
                     var capsule = go.GetComponent<CapsuleCollider>();
-                    if (capsule is null ||
+                    if (capsule == null ||
                         !SameVector(capsule.center, Vector3.zero) ||
                         !Mathf.Approximately(capsule.radius, 0.5f) ||
                         !Mathf.Approximately(capsule.height, 2f) ||
@@ -459,7 +458,7 @@ namespace OpWeave.Operations
                 case "quad":
                 {
                     var meshCollider = go.GetComponent<MeshCollider>();
-                    if (meshCollider is null || meshCollider.sharedMesh != builtin)
+                    if (meshCollider == null || meshCollider.sharedMesh != builtin)
                     {
                         reason = "collider configuration differs";
                         return false;

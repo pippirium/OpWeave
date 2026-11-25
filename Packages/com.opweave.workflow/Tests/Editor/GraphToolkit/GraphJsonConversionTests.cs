@@ -1079,6 +1079,385 @@ namespace OpWeave.UnityAdapter.Tests
             });
         }
 
+        // ── SPEC §0.6 SG-17: a malformed carrier payload is diagnosed,
+        //    never silently dropped (T-W5.3-15) ─────────────────────────
+
+        [Test]
+        public void Export_MalformedNodeExtrasJson_DiagnosesAndRefusesSave()
+        {
+            WithGraph(graph =>
+            {
+                var path = JsonPath("malextras.opweave.json");
+                var baseline = GraphJsonConverter.Import(graph, FixtureLossy).Value!;
+                File.WriteAllText(path, FixtureLossy);
+
+                // The extrasJson carrier holds the node's carried wires
+                // and parameters: corrupting it must produce a
+                // diagnostic, not a silent drop of the content it holds.
+                var alpha = graph.GetNodes()
+                    .OfType<OperationNode>()
+                    .Single(n => n.nodeId == "alpha");
+                alpha.extrasJson = "{ not valid json";
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok, "the export still produces a document");
+                var diagnostics = exported.Diagnostics.ToList();
+                Assert.AreEqual(1, diagnostics.Count,
+                    "the single malformed carrier produces exactly one diagnostic");
+                Assert.IsTrue(
+                    diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Severity == Severity.Error &&
+                        d.Message.Contains("extrasJson") &&
+                        d.Message.Contains("alpha")),
+                    "the malformed extrasJson is diagnosed, never read as absent");
+
+                var doc = exported.Value!;
+                Assert.IsFalse(
+                    doc.Nodes.Single(n => n.Id == "alpha").Parameters.ContainsKey("unknownPort"),
+                    "the undecodable carried parameter is not re-emitted");
+                Assert.IsFalse(
+                    doc.DataEdges.Any(e => e.From.Node == "alpha"),
+                    "the carried data edge inside the malformed carrier is not re-emitted");
+                Assert.IsTrue(
+                    doc.DataEdges.Contains(new DataEdge(
+                        new PortRef("ghost", "result"), new PortRef("alpha", "source"))),
+                    "carried items on a well-formed carrier still resolve by name");
+
+                var refused = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: false);
+                Assert.AreEqual(GraphJsonSaveStatus.InvalidGraph, refused.Status,
+                    "a save that would drop the diagnosed content is blocked; " +
+                    "error: " + refused.ErrorMessage);
+                Assert.AreEqual(FixtureLossy, File.ReadAllText(path));
+
+                var overwrite = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: true);
+                Assert.AreEqual(GraphJsonSaveStatus.Saved, overwrite.Status,
+                    "an explicit human overwrite drops the malformed carrier by choice; " +
+                    "error: " + overwrite.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public void Export_MalformedGraphCarriedJson_DiagnosesAndRefusesSave()
+        {
+            WithGraph(graph =>
+            {
+                var path = JsonPath("malcarried.opweave.json");
+                var baseline = GraphJsonConverter.Import(graph, FixtureLossy).Value!;
+                File.WriteAllText(path, FixtureLossy);
+
+                graph.carriedJson = "{ not valid json";
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok);
+                var diagnostics = exported.Diagnostics.ToList();
+                Assert.AreEqual(1, diagnostics.Count);
+                Assert.IsTrue(
+                    diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("carriedJson")),
+                    "the malformed graph-level carrier is diagnosed");
+
+                // A present carrier member that is not a decodable JSON
+                // object is malformed the same way.
+                graph.carriedJson = "\"not an object\"";
+                var nonObject = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    nonObject.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("carriedJson")),
+                    "a parseable non-object carrier payload is malformed too");
+
+                var refused = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: false);
+                Assert.AreEqual(GraphJsonSaveStatus.InvalidGraph, refused.Status,
+                    "error: " + refused.ErrorMessage);
+                Assert.AreEqual(FixtureLossy, File.ReadAllText(path));
+            });
+        }
+
+        [Test]
+        public void Export_MalformedPortConstant_DiagnosesAndRefusesSave()
+        {
+            WithGraph(graph =>
+            {
+                var path = JsonPath("malport.opweave.json");
+                var baseline = GraphJsonConverter.Import(graph, FixtureFull).Value!;
+                File.WriteAllText(path, FixtureFull);
+
+                // The OwValue port constant is Canonical JSON: corrupting
+                // it must be diagnosed, not silently dropped (SPEC §0.6
+                // SG-17).
+                var alpha = graph.GetNodes()
+                    .OfType<OperationNode>()
+                    .Single(n => n.nodeId == "alpha");
+                var port = alpha.GetInputPortByName("name");
+                Assert.IsNotNull(port, "the alpha descriptor declares the name port");
+                Assert.IsTrue(port!.TrySetValue(new OwValue { json = "{ not valid json" }));
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok);
+                Assert.IsTrue(
+                    exported.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("name") &&
+                        d.Message.Contains("alpha")),
+                    "the malformed port constant is diagnosed, never read as absent");
+                Assert.IsFalse(
+                    exported.Value!.Nodes.Single(n => n.Id == "alpha")
+                        .Parameters.ContainsKey("name"),
+                    "the unparseable constant is not emitted as a parameter");
+                Assert.IsTrue(
+                    exported.Value!.Nodes.Single(n => n.Id == "alpha")
+                        .Parameters.ContainsKey("config"),
+                    "well-formed constants on other ports are unaffected");
+
+                var refused = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: false);
+                Assert.AreEqual(GraphJsonSaveStatus.InvalidGraph, refused.Status,
+                    "error: " + refused.ErrorMessage);
+                Assert.AreEqual(FixtureFull, File.ReadAllText(path));
+            });
+        }
+
+        [Test]
+        public void Export_MalformedInputVariablePayload_DiagnosesAndKeepsFallback()
+        {
+            WithGraph(graph =>
+            {
+                var path = JsonPath("malinput.opweave.json");
+                var baseline = GraphJsonConverter.Import(graph, FixtureLossy).Value!;
+                File.WriteAllText(path, FixtureLossy);
+
+                // The OwValue payload carries the input's §A6 record and
+                // import markers: a malformed one is diagnosed and still
+                // decodes by the documented fallback — while the carried
+                // bindings to it refuse instead of guessing.
+                var scene = graph.GetVariables().Single(v => v.Name == "scene");
+                Assert.IsTrue(
+                    scene.TrySetDefaultValue(new OwValue { json = "{ not valid json" }));
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok);
+                var diagnostics = exported.Diagnostics.ToList();
+                Assert.IsTrue(
+                    diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("payload") &&
+                        d.Message.Contains("scene")),
+                    "the malformed variable payload is diagnosed, never read as absent");
+                Assert.IsTrue(
+                    diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        !d.Message.Contains("payload")),
+                    "the unprovable identity still refuses the carried bindings");
+
+                var doc = exported.Value!;
+                var input = doc.Inputs.Single(i => i.Id == "scene");
+                Assert.AreEqual("core.Json", input.Type,
+                    "the documented fallback decode still applies");
+                Assert.IsFalse(input.Required);
+                Assert.IsFalse(
+                    doc.InputBindings.Any(b => b.FromInput == "scene"),
+                    "the carried bindings are refused, not rewired by guess");
+
+                var refused = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: false);
+                Assert.AreEqual(GraphJsonSaveStatus.InvalidGraph, refused.Status,
+                    "error: " + refused.ErrorMessage);
+                Assert.AreEqual(FixtureLossy, File.ReadAllText(path));
+            });
+        }
+
+        [Test]
+        public void RoundTrip_GraphLevelCarriedContent_ReEmittedVerbatim()
+        {
+            WithGraph(graph =>
+            {
+                // A wire neither of whose endpoint nodes exists lives in
+                // the graph-level carriedJson carrier; a well-formed one
+                // round-trips verbatim with no diagnostic.
+                const string fixture = @"{
+  ""schemaVersion"": ""1.0"",
+  ""id"": ""test.conv.graphcarried"",
+  ""nodes"": [
+    { ""id"": ""start"", ""operation"": ""core.start"", ""version"": 1 },
+    { ""id"": ""alpha"", ""operation"": ""test.conv.alpha"", ""version"": 1 }
+  ],
+  ""controlEdges"": [
+    { ""from"": ""start"", ""to"": ""alpha"" }
+  ],
+  ""dataEdges"": [
+    { ""from"": { ""node"": ""alpha"", ""port"": ""result"" }, ""to"": { ""node"": ""missing"", ""port"": ""in"" } },
+    { ""from"": { ""node"": ""gone"", ""port"": ""out"" }, ""to"": { ""node"": ""vanished"", ""port"": ""in"" } }
+  ]
+}";
+                var read = GraphJsonConverter.Import(graph, fixture);
+                Assert.IsTrue(read.Ok, "the fixture must read");
+                var baseline = read.Value!;
+                Assert.IsFalse(string.IsNullOrEmpty(graph.carriedJson),
+                    "the wire with no endpoint node lands in the graph-level carrier");
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok);
+                Assert.IsEmpty(exported.Diagnostics.ToList(),
+                    "a well-formed carrier produces no diagnostic");
+                Assert.AreEqual(
+                    baseline.Canonical.CanonicalText,
+                    exported.Value!.Canonical.CanonicalText,
+                    "the graph-level carried wire round-trips verbatim");
+            });
+        }
+
+        // ── SPEC §0.6 SG-17: a carried wire that resolves but does not
+        //    decode is malformed carried content — diagnosed, never
+        //    silently dropped or rewritten (T-W5.3-15 review) ───────────
+
+        [Test]
+        public void Export_UndecodableCarriedWireItem_DiagnosesAndRefusesSave()
+        {
+            WithGraph(graph =>
+            {
+                var path = JsonPath("malwire.opweave.json");
+                var baseline = GraphJsonConverter.Import(graph, FixtureMinimal).Value!;
+                File.WriteAllText(path, FixtureMinimal);
+
+                // A carried wire whose "item" no longer decodes as its
+                // kind's record resolves every reference yet cannot be
+                // re-emitted: it is malformed carried content, never a
+                // silent drop (SPEC §0.6 SG-17).
+                graph.carriedJson = @"{""controlEdges"": [{""item"": {}}]}";
+
+                var exported = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(exported.Ok, "the export still produces a document");
+                Assert.IsTrue(
+                    exported.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("control edge")),
+                    "the undecodable carried control edge is diagnosed");
+                Assert.IsEmpty(exported.Value!.ControlEdges,
+                    "the malformed item is not emitted");
+
+                // A present member of the wrong type — "from" is a
+                // number, not a node id — fails the same way.
+                graph.carriedJson =
+                    @"{""controlEdges"": [{""item"": {""from"": 5, ""to"": ""x""}}]}";
+                var nonString = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    nonString.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("control edge")),
+                    "a non-string endpoint member is diagnosed too");
+
+                var refused = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: false);
+                Assert.AreEqual(GraphJsonSaveStatus.InvalidGraph, refused.Status,
+                    "a save that would silently drop the malformed wire is blocked; " +
+                    "error: " + refused.ErrorMessage);
+                Assert.AreEqual(FixtureMinimal, File.ReadAllText(path));
+
+                var overwrite = GraphJsonFile.SaveToFile(
+                    graph, path, baseline, explicitOverwrite: true);
+                Assert.AreEqual(GraphJsonSaveStatus.Saved, overwrite.Status,
+                    "an explicit human overwrite drops the malformed wire by choice; " +
+                    "error: " + overwrite.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public void Export_MalformedCarriedWireMembers_DiagnoseEveryEmissionLane()
+        {
+            WithGraph(graph =>
+            {
+                var baseline = GraphJsonConverter.Import(graph, FixtureMinimal).Value!;
+
+                // A malformed PortRef member — "port" is a number —
+                // fails the wire's decode in every emission lane: each
+                // is diagnosed on the shared SG-17 channel, never
+                // silently dropped.
+                graph.carriedJson = @"{""dataEdges"": [{""item"": {""from"": {""node"": ""a"", ""port"": 5}, ""to"": {""node"": ""b"", ""port"": ""p""}}}]}";
+                var dataEdge = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    dataEdge.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("data edge")),
+                    "a malformed PortRef member is diagnosed in the data-edge lane");
+
+                graph.carriedJson = @"{""inputBindings"": [{""item"": {""fromInput"": ""scene"", ""to"": {""node"": ""a"", ""port"": 5}}}]}";
+                var binding = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    binding.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("input binding")),
+                    "the input-binding lane is diagnosed too");
+
+                graph.carriedJson = @"{""outputs"": [{""item"": {""id"": ""o"", ""from"": {""node"": ""a"", ""port"": 5}}}]}";
+                var output = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    output.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("output")),
+                    "the output lane is diagnosed too");
+
+                // A malformed optional member — "fromPort" is a
+                // number — must not silently rewrite to the "next"
+                // default: the record is malformed and diagnosed,
+                // never emitted modified.
+                graph.carriedJson = @"{""controlEdges"": [{""item"": {""from"": ""a"", ""to"": ""b"", ""fromPort"": 5}}]}";
+                var fromPort = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    fromPort.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("control edge")),
+                    "a malformed \"fromPort\" is diagnosed, not rewritten");
+                Assert.IsFalse(
+                    fromPort.Value!.ControlEdges.Any(e => e.From == "a" && e.To == "b"),
+                    "no silently rewritten a → b edge may be emitted");
+            });
+        }
+
+        [Test]
+        public void Export_MalformedCarrierSubMembers_AreDiagnosed()
+        {
+            WithGraph(graph =>
+            {
+                var baseline = GraphJsonConverter.Import(graph, FixtureMinimal).Value!;
+
+                // A non-object "item" stays diagnosed at carrier decode.
+                graph.carriedJson = @"{""controlEdges"": [{""item"": 5}]}";
+                var scalar = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    scalar.Diagnostics.Any(d => d.Code == ErrorCodes.OW_UNITY_002),
+                    "a non-object item is diagnosed at carrier decode");
+
+                // A non-string reference entry is malformed carried
+                // content the same way — diagnosed, never skipped
+                // silently (SPEC §0.6 SG-17).
+                graph.carriedJson = @"{""controlEdges"": [{""item"": {""from"": ""a"", ""to"": ""b""}, ""nodes"": [5]}]}";
+                var refs = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    refs.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("nodes")),
+                    "a non-string reference entry is diagnosed, not skipped");
+
+                // A type-mismatched member on a node's extrasJson
+                // carrier — "label" is a number — is diagnosed, not
+                // dropped.
+                graph.carriedJson = "";
+                var start = graph.GetNodes().OfType<StartNode>().Single();
+                start.extrasJson = @"{""label"": 5}";
+                var extras = GraphJsonConverter.Export(graph, baseline);
+                Assert.IsTrue(
+                    extras.Diagnostics.Any(d =>
+                        d.Code == ErrorCodes.OW_UNITY_002 &&
+                        d.Message.Contains("label")),
+                    "a type-mismatched extras member is diagnosed, not dropped");
+            });
+        }
+
         // ── helpers ─────────────────────────────────────────────────────────
 
         private string JsonPath(string name) => Path.Combine(_jsonDir, name);

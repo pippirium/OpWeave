@@ -22,16 +22,23 @@ namespace OpWeave.Core.Persistence
     /// <remarks>
     /// <para><b>Lock.</b> For each resolved target path P the exclusion is an
     /// OS file handle on
-    /// <c>Library/OpWeave/locks/json-&lt;sha256(normalized P)&gt;.lock</c>,
+    /// <c>&lt;P's directory&gt;/.opweave-locks/json-&lt;sha256(normalized P)&gt;.lock</c>,
     /// held open for the whole read–decide–write critical section — a
     /// <c>CreateFileW</c> handle with share mode 0, the same mechanism and
     /// semantics as <see cref="CoordinatorRunLock"/>: a live owner's lock is
     /// never stolen, the lock file is never replaced or deleted while held,
-    /// and the OS releases the handle on process death. v1 supports the
-    /// Windows Editor only (SPEC §E2 item 3, decision D): the cross-process
-    /// exclusion is unproven on every other platform, so acquisition there
-    /// fails closed before the lock file is opened — never Busy, never
-    /// retried. On Windows a contended lock is retried for up to
+    /// and the OS releases the handle on process death. The lock file lives
+    /// beside the target — its path is a function of the canonical resolved
+    /// target alone and never of the coordinator's project root, so two
+    /// coordinators rooted at overlapping project directories (a Unity
+    /// project nested inside another project's directory) address one
+    /// physical file through one exclusion (Issue #400), and the
+    /// dot-prefixed directory stays inside the project while Unity's asset
+    /// import ignores it. v1 supports the Windows Editor only (SPEC §E2
+    /// item 3, decision D): the cross-process exclusion is unproven on
+    /// every other platform, so acquisition there fails closed before the
+    /// lock file is opened — never Busy, never retried. On Windows a
+    /// contended lock is retried for up to
     /// <see cref="DefaultAcquireTimeoutMilliseconds"/> (2 s), then reports
     /// <see cref="AcquireStatus.Busy"/>.</para>
     /// <para><b>Ownership.</b> A path is only ever locked or written after it
@@ -118,10 +125,6 @@ namespace OpWeave.Core.Persistence
 
         /// <summary>The project root with its own reparse points resolved.</summary>
         internal string ResolvedProjectRoot => _resolvedProjectRoot;
-
-        /// <summary>The per-path lock files' directory under the project.</summary>
-        internal string LocksDirectory => Path.Combine(
-            _resolvedProjectRoot, "Library", "OpWeave", "locks");
 
         /// <summary>The crash-recovery intent records' directory under the project.</summary>
         internal string IntentDirectory => Path.Combine(
@@ -235,10 +238,16 @@ namespace OpWeave.Core.Persistence
 
         /// <summary>
         /// The lock file for a resolved target path:
-        /// <c>Library/OpWeave/locks/json-&lt;sha256(normalized P)&gt;.lock</c>.
+        /// <c>&lt;P's directory&gt;/.opweave-locks/json-&lt;sha256(normalized P)&gt;.lock</c>.
         /// The hash input is the OS-resolved path with forward slashes and
         /// case-folded where the platform's paths compare case-insensitively,
         /// so every process addressing the same file derives the same lock.
+        /// The namespace is the canonical target alone — no project-root
+        /// component enters it — so overlapping project roots that resolve
+        /// one physical file share one exclusion (Issue #400), while
+        /// distinct files never collide. The dot-prefixed directory sits
+        /// beside the target: inside the project like the target itself,
+        /// and ignored by Unity's asset import.
         /// </summary>
         internal string LockPathFor(string resolvedPath)
         {
@@ -251,8 +260,10 @@ namespace OpWeave.Core.Persistence
             {
                 normalized = normalized.Substring(0, normalized.Length - 1);
             }
+            var directory = Path.GetDirectoryName(resolvedPath) ?? resolvedPath;
             return Path.Combine(
-                LocksDirectory, "json-" + Sha256Hex(s_utf8.GetBytes(normalized)) + ".lock");
+                directory, ".opweave-locks",
+                "json-" + Sha256Hex(s_utf8.GetBytes(normalized)) + ".lock");
         }
 
         /// <summary>
@@ -275,7 +286,7 @@ namespace OpWeave.Core.Persistence
             var lockPath = LockPathFor(resolvedPath);
             try
             {
-                Directory.CreateDirectory(LocksDirectory);
+                Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
             }
             catch (Exception e) when (IsIoFailure(e))
             {

@@ -38,6 +38,17 @@ namespace OpWeave.Operations
     /// </remarks>
     internal static class PrefabInstanceEvidence
     {
+        // The marker strings <see cref="OverridesOf"/> and
+        // <see cref="NormalizeMember"/> record where the session could
+        // not inspect a member. Together with
+        // <see cref="ComponentEvidence.MissingComponentMarker"/> they are
+        // the unverifiable markers of the evidence JSON: evidence-shaped
+        // tokens that carry no inspected content, which a comparison must
+        // never treat as equal — not even to an identical marker
+        // (fail closed, Issue #313).
+        private const string UnreadablePrefix = "<unreadable:";
+        private const string UnsupportedPrefix = "<unsupported:";
+
         /// <summary>
         /// Resolves the required Prefab-instance input port to the live
         /// outermost instance root — §G2 resolution diagnostics pass
@@ -134,7 +145,8 @@ namespace OpWeave.Operations
             var handle = PrefabUtility.GetPrefabInstanceHandle(instanceRoot);
             if (handle is null)
             {
-                return JValue.CreateString("<unreadable: not a Prefab instance>");
+                return JValue.CreateString(
+                    UnreadablePrefix + " not a Prefab instance>");
             }
             SerializedObject serialized;
             try
@@ -144,12 +156,13 @@ namespace OpWeave.Operations
             catch (Exception e)
             {
                 return JValue.CreateString(
-                    "<unreadable: " + e.GetType().Name + ">");
+                    UnreadablePrefix + " " + e.GetType().Name + ">");
             }
             var modification = serialized.FindProperty("m_Modification");
             if (modification is null)
             {
-                return JValue.CreateString("<unreadable: no m_Modification>");
+                return JValue.CreateString(
+                    UnreadablePrefix + " no m_Modification>");
             }
             var iterator = modification.Copy();
             var end = iterator.GetEndProperty();
@@ -226,13 +239,27 @@ namespace OpWeave.Operations
                     reason = "an object in the hierarchy was reparented";
                     return false;
                 }
-                if (!JToken.DeepEquals(
-                        expected["components"], actual["components"]))
+                var expectedComponents = expected["components"];
+                var actualComponents = actual["components"];
+                if (!ComponentsVerifiable(expectedComponents) ||
+                    !ComponentsVerifiable(actualComponents))
+                {
+                    reason = "an object's component evidence could not be inspected";
+                    return false;
+                }
+                if (!JToken.DeepEquals(expectedComponents, actualComponents))
                 {
                     reason = "an object's component composition differs from the snapshot";
                     return false;
                 }
-                if (!JToken.DeepEquals(expected["state"], actual["state"]))
+                var expectedState = expected["state"];
+                var actualState = actual["state"];
+                if (expectedState is null || actualState is null)
+                {
+                    reason = "an object's serialized state could not be inspected";
+                    return false;
+                }
+                if (!JToken.DeepEquals(expectedState, actualState))
                 {
                     reason = "an object's serialized state differs from the snapshot";
                     return false;
@@ -288,21 +315,108 @@ namespace OpWeave.Operations
             return true;
         }
 
-        // The ordered component entries of one object, tolerating a missing
-        // script the way GameObjectEvidence.ComponentNames does — an
-        // uninspectable member records no handle, so later comparisons
-        // treat it as unverifiable rather than identical (fail closed).
-        private static JArray ComponentsOf(GameObject go)
+        /// <summary>
+        /// Whether a recorded or freshly re-read structure list is fully
+        /// inspectable — every entry carries the <c>state</c> member
+        /// <see cref="StructureEntry"/> writes and a <c>components</c>
+        /// list whose members are all complete
+        /// <see cref="ComponentEvidence.Entry"/> records. A structure
+        /// carrying an unverifiable marker can never prove two
+        /// hierarchies identical, not even against an identical marker
+        /// (fail closed, Issue #313).
+        /// </summary>
+        internal static bool StructureVerifiable(JToken? structure)
         {
-            var components = new JArray();
-            foreach (var component in go.GetComponents<Component>())
+            if (structure is not JArray entries)
             {
-                components.Add(component == null
-                    ? new JObject { ["type"] = "<missing>" }
-                    : ComponentEvidence.Entry(component));
+                return false;
             }
-            return components;
+            foreach (var entry in entries)
+            {
+                if (entry is not JObject obj ||
+                    obj["state"] is null ||
+                    !ComponentsVerifiable(obj["components"]))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
+
+        /// <summary>
+        /// Whether a recorded or freshly re-read override list is fully
+        /// inspectable — the <see cref="JArray"/> <see cref="OverridesOf"/>
+        /// returns on success, with no unverifiable marker anywhere inside
+        /// it. A "<unreadable:…>" list or a member's
+        /// "<unsupported:…>" data can never prove the override lists
+        /// identical (fail closed, Issue #313).
+        /// </summary>
+        internal static bool OverridesVerifiable(JToken? overrides) =>
+            overrides is JArray && !ContainsUnverifiableMarker(overrides);
+
+        // Every entry must be a complete ComponentEvidence.Entry — a
+        // missing script's "<missing>" marker or an entry without its
+        // normalized "content" is unverifiable evidence, never proof the
+        // composition is unchanged (Issue #313).
+        private static bool ComponentsVerifiable(JToken? components)
+        {
+            if (components is not JArray entries)
+            {
+                return false;
+            }
+            foreach (var entry in entries)
+            {
+                if (!ComponentEvidence.IsVerifiableEntry(entry))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // A marker string leaf anywhere in the document means the member
+        // was never inspected: the "<missing>" component marker, and the
+        // "<unreadable:…>" / "<unsupported:…>" strings OverridesOf and
+        // NormalizeMember record. Marker-bearing evidence can never prove
+        // sameness (Issue #313).
+        private static bool ContainsUnverifiableMarker(JToken token)
+        {
+            if (token is JValue { Type: JTokenType.String } value)
+            {
+                return value.Value is string text &&
+                    (text == ComponentEvidence.MissingComponentMarker ||
+                     text.StartsWith(UnreadablePrefix, StringComparison.Ordinal) ||
+                     text.StartsWith(UnsupportedPrefix, StringComparison.Ordinal));
+            }
+            if (token is JObject obj)
+            {
+                foreach (var property in obj.Properties())
+                {
+                    if (ContainsUnverifiableMarker(property.Value))
+                    {
+                        return true;
+                    }
+                }
+            }
+            else if (token is JArray array)
+            {
+                foreach (var element in array)
+                {
+                    if (ContainsUnverifiableMarker(element))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // The ordered component entries of one object — the shared
+        // ComponentEvidence list, which records a missing script's slot
+        // as its unverifiable marker so the comparisons above treat it as
+        // never identical (fail closed, Issue #313).
+        private static JArray ComponentsOf(GameObject go) =>
+            ComponentEvidence.ComponentsOf(go);
 
         private static void Walk(Transform current, JArray entries)
         {
@@ -317,10 +431,10 @@ namespace OpWeave.Operations
         // object references resolve to their persistent guid · localFileId
         // key or the session handle of a scene object, scalars carry their
         // value and generic structs recurse member by member. An
-        // uninspectable member type records a marker — both sides record
-        // the same marker, and a foreign change inside it stays undetected
-        // only where Unity exposes nothing to compare (fail closed by
-        // shape, never by guessing).
+        // uninspectable member type records a marker — and identical
+        // markers can never prove the member unchanged, because the
+        // comparisons refuse equality on marker-bearing evidence (fail
+        // closed, Issue #313).
         private static JToken NormalizeMember(SerializedProperty property)
         {
             if (property.isArray &&
@@ -369,7 +483,7 @@ namespace OpWeave.Operations
                     return obj;
                 default:
                     return JValue.CreateString(
-                        "<unsupported:" + property.propertyType + ">");
+                        UnsupportedPrefix + property.propertyType + ">");
             }
         }
 

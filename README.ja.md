@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-OpWeave は、Unity Editor 向けのワークフローエンジンです。型付きの操作(Operation)を検索してワークフロー文書に組み立て、コンパイル・逐次実行し、中断された実行を永続ジャーナルから復旧します。UPM パッケージ `com.opweave.workflow` バージョン **0.1.1** として配布し、ライセンスは [Apache License 2.0](LICENSE) です。
+OpWeave は、Unity Editor 向けのワークフローエンジンです。型付きの操作(Operation)を検索してワークフロー文書に組み立て、コンパイル・逐次実行し、中断された実行を永続ジャーナルから復旧します。UPM パッケージ `com.opweave.workflow` バージョン **0.1.2** として配布し、ライセンスは [Apache License 2.0](LICENSE) です。
 
 ## Windows v1 の機能
 
@@ -22,6 +22,7 @@ OpWeave は、Unity Editor 向けのワークフローエンジンです。型�
 - **検証済み Unity Editor:** 6000.5.11f1
 - **パッケージマニフェストの下限:** Unity `6000.0`
 - **Graph Toolkit オーサリング UI:** Unity 6000.5 以降。検証済み構成は 6000.5.11f1
+- **互換性検証:** Unity 6000.0.85f1 は Graph Toolkit 以外のパッケージ面のみを対象
 - macOS / Linux は **v1 では未サポート**です(既知の制限を参照)。
 
 マニフェストの下限はコンパイル下限であり、検証済みサポート対象ではありません。Unity 6000.0 で Graph Toolkit GUI 機能がサポートされると扱わないでください。
@@ -35,7 +36,7 @@ OpWeave は、Unity Editor 向けのワークフローエンジンです。型�
 3. 次を入力:
 
    ```
-   https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.1
+   https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.2
    ```
 
 依存パッケージ(`com.unity.nuget.newtonsoft-json`、`com.unity.nuget.mono-cecil`)は Unity レジストリから自動的に解決されます。
@@ -47,6 +48,7 @@ OpWeave は、Unity Editor 向けのワークフローエンジンです。型�
 前回のリリースも次の URL でインストールできます。
 
 ```
+https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.1
 https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.0
 ```
 
@@ -106,6 +108,21 @@ Operation 実装は通常 `OperationBase` から派生し、`[OpWeaveOperation(i
 | `Schemas~`, `Samples~`, `Editor/Templates~` | JSON スキーマ、サンプルワークフロー、テンプレート(Unity が無視するフォルダ) |
 | `Tests` | パッケージのテストアセンブリと、テスト専用の同梱プラグイン |
 
+## 0.1.2 の変更
+
+バージョン 0.1.2 は後方互換のパッチリリースです。
+
+- 正準 `.opweave.json` 保存ロックを、重複するプロジェクトルート間でも正準解決済みの対象パスで排他するよう改善。
+- インデクサやウイルススキャナによる短期間の書き込み保持など、一時的な設定書き込み失敗を上限付きで自動再試行。永続的な失敗や外部変更は引き続き fail-closed です。
+- 破棄された Unity オブジェクトを、C# 参照が残っていても存在しないものとして正しく扱うよう修正。
+- 同じパスの削除済みアセットについて、古い GUID がフォルダ作成の衝突と誤判定されないよう修正。
+- Prefab Unpack の照合で、検証可能な記録済み・現在の証拠がある場合に限って適用済み/完了と判断するよう改善。
+- 不正な graph-carrier JSON を静かに捨てるのではなく、明示的な `OW-UNITY-002` 診断を返すよう改善。
+- Graph/JSON 同期テストの分離性を改善。これは内部テスト基盤の品質改善であり、新しい公開機能ではありません。
+- Unity 6000.0.85f1 で Graph Toolkit 以外のパッケージ互換性を検証。Graph Toolkit オーサリングは引き続き Unity 6000.5 以降専用です。
+
+0.1.2 で既存の公開 API、Operation/Type ID、planHash、ジャーナル形式、ワークフロー形式、設定形式を意図的に変更したものはありません。0.1.1 からの移行作業は不要です。`.opweave.json` 対象の横に `.opweave-locks` ディレクトリが表示されることがありますが、これは Unity のインポート対象外の意図的なロック成果物です。
+
 ## 0.1.1 の変更
 
 バージョン 0.1.1 は後方互換のパッチリリースです。
@@ -122,7 +139,8 @@ Operation 実装は通常 `OperationBase` から派生し、`[OpWeaveOperation(i
 
 | バージョン | 状態 | 内容 |
 | --- | --- | --- |
-| 0.1.1 | 現在の公開リリース | Project Browser でのグラフ作成、Runner lock 引き継ぎ修正、Preflight 未確定入力修正、安定性・受入改善 |
+| 0.1.2 | 現在の公開リリース | 安全な JSON 保存ロック、設定書き込み再試行、破棄オブジェクト/削除アセット修正、Prefab Unpack 証拠の安全性、不正 graph-carrier 診断、Unity 6000.0 互換性検証 |
+| 0.1.1 | 以前の公開リリース | Project Browser でのグラフ作成、Runner lock 引き継ぎ修正、Preflight 未確定入力修正、安定性・受入改善 |
 | 0.1.0 | 以前の公開リリース | 初回の Windows v1 公開パッケージ移行 |
 
 ## ライセンス
@@ -139,4 +157,4 @@ OpWeave 自体のコードと文書は [Apache License, Version 2.0](LICENSE)。
 
 ## 出所(Provenance)
 
-バージョン `0.1.1` は、[VERSION](VERSION) と [release-lock.json](release-lock.json) に記録された、受入済みの Windows v1 開発リビジョンに対応します(ソース: 非公開の `pippirium/OpWeave-dev`。G-09 受入証跡はそこに記録)。`0.1.1` は単一の不変プロダクトを識別し、修正はタグの付け替えではなく次のバージョンで提供します。
+バージョン `0.1.2` は、[VERSION](VERSION) と [release-lock.json](release-lock.json) に記録された、受入済みの Windows v1 開発リビジョンに対応します(ソース: 非公開の `pippirium/OpWeave-dev`。Stage A-D 受入証跡はそこに記録)。`0.1.2` は単一の不変プロダクトを識別し、修正はタグの付け替えではなく次のバージョンで提供します。

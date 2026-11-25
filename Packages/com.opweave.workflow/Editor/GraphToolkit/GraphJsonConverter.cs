@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpWeave.Core;
 using OpWeave.Core.Model;
@@ -57,8 +58,11 @@ namespace OpWeave.GraphToolkit
     /// rest of the §A6 record as Canonical JSON
     /// <c>{"type","required","default"?,"description"?}</c>. WF output ↔
     /// <see cref="VariableKind.Output"/> variable; its <see cref="OwValue"/>
-    /// carries <c>{"description"?}</c>. A variable whose payload is absent or
-    /// unparseable decodes as <c>{"type":"core.Json","required":false}</c>.</item>
+    /// carries <c>{"description"?}</c>. A variable whose payload is absent
+    /// decodes as <c>{"type":"core.Json","required":false}</c>; an
+    /// unparseable payload decodes the same way and additionally produces
+    /// an OW-UNITY-002 diagnostic, so the content is never dropped
+    /// silently (SPEC §0.6 SG-17).</item>
     /// <item>Node <c>label</c>/<c>policy</c> ride in the serialized
     /// <c>extrasJson</c> carrier of <see cref="OperationNode"/>/
     /// <see cref="StartNode"/>; <c>core.start</c> maps to
@@ -99,7 +103,13 @@ namespace OpWeave.GraphToolkit
     /// <see cref="GraphJsonFile.SaveToFile"/> refuses the write as
     /// <see cref="GraphJsonSaveStatus.InvalidGraph"/> unless the human
     /// explicitly overwrites — which drops the affected items by choice.
-    /// One an identical live wire already covers is not duplicated.
+    /// One an identical live wire already covers is not duplicated. A
+    /// carrier payload that cannot be decoded at all — a malformed
+    /// <c>extrasJson</c> on a node, the graph-level <c>carriedJson</c>,
+    /// or a malformed <see cref="OwValue"/> constant or variable payload
+    /// — is not read as absent either: export produces one OW-UNITY-002
+    /// diagnostic naming the carrier, so the content it held is dropped
+    /// only through the same explicit human overwrite.
     /// Hand-editing the internal <c>importedAs</c>/<c>importToken</c>
     /// markers is unsupported: an element whose marker no longer proves
     /// its identity is unprovable, never guessed.</item>
@@ -517,6 +527,12 @@ namespace OpWeave.GraphToolkit
             var carriedSources = new List<CarriedContent>();
             var identity = new CarriedIdentity();
             var provenance = new ImportProvenance(graph);
+            // The export's SG-17 diagnostic channel: a refused carried item
+            // and a malformed carrier payload (unparseable extrasJson,
+            // carriedJson or OwValue payload) travel it alike, so a
+            // successful export still refuses the write unless the human
+            // explicitly overwrites (SPEC §0.6 SG-17).
+            var carriedRefusals = new List<Diagnostic>();
 
             foreach (var node in graph.GetNodes())
             {
@@ -538,8 +554,9 @@ namespace OpWeave.GraphToolkit
                         nodeData.Version = operation.version;
                         extrasJson = operation.extrasJson;
                     }
-                    var extras = ParseExtras(extrasJson);
-                    ApplyExtras(nodeData, extras);
+                    var extras = ParseObjectPayload(
+                        extrasJson, $"extrasJson of node '{nodeId}'", carriedRefusals, nodeId);
+                    ApplyExtras(nodeData, extras, carriedRefusals, nodeId);
                     // The import-time identity the SG-17 carrier resolves
                     // against: a carried wire referencing this node follows
                     // it across a nodeId edit — but only while the claimant
@@ -550,8 +567,12 @@ namespace OpWeave.GraphToolkit
                         StringOf(extras?["importedAs"]),
                         provenance.IsImportCreated(ImportTokenOf(node)));
                     nodeData.Parameters = CollectParameters(
-                        node, nodeId, dataEdges, inputBindings);
-                    var carried = CarriedContent.FromJson(extras?["carried"]);
+                        node, nodeId, dataEdges, inputBindings, carriedRefusals);
+                    var carried = ReadCarried(
+                        extras?["carried"],
+                        $"carried extras of node '{nodeId}'",
+                        carriedRefusals,
+                        nodeId);
                     if (carried is not null)
                     {
                         MergeCarriedParameters(nodeData, carried.Parameters);
@@ -637,12 +658,14 @@ namespace OpWeave.GraphToolkit
                 {
                     continue;
                 }
+                string? payloadCarrier = null;
                 if (variable.VariableKind == VariableKind.Input)
                 {
                     identity.Inputs.Add(
                         variableName,
                         ImportedAsOf(variable),
                         provenance.IsImportCreated(ImportTokenOf(variable)));
+                    payloadCarrier = $"payload of input variable '{variableName}'";
                 }
                 else if (variable.VariableKind == VariableKind.Output)
                 {
@@ -650,16 +673,30 @@ namespace OpWeave.GraphToolkit
                         variableName,
                         ImportedAsOf(variable),
                         provenance.IsImportCreated(ImportTokenOf(variable)));
+                    payloadCarrier = $"payload of output variable '{variableName}'";
+                }
+                // A malformed OwValue variable payload — the serialized
+                // record and import markers the variable carries — is
+                // diagnosed once here for every input/output variable
+                // rather than read as absent (SPEC §0.6 SG-17). The input
+                // decode itself keeps the documented
+                // {"type":"core.Json","required":false} fallback; the
+                // dropped content leaves only through an explicit
+                // overwrite.
+                if (payloadCarrier is not null &&
+                    variable.TryGetDefaultValue<OwValue>(out var payload))
+                {
+                    _ = ParseObjectPayload(payload?.json, payloadCarrier, carriedRefusals);
                 }
             }
-            var graphCarried = CarriedContent.FromJson(ParseToken(graph.carriedJson));
+            var graphCarried = ReadCarriedJson(
+                graph.carriedJson, "graph carriedJson", carriedRefusals);
             if (graphCarried is not null)
             {
                 carriedSources.Add(graphCarried);
             }
             var emittedOutputIds = new HashSet<string>(
                 outputRecords.Select(o => o.Id), StringComparer.Ordinal);
-            var carriedRefusals = new List<Diagnostic>();
             foreach (var carried in carriedSources)
             {
                 EmitCarried(
@@ -701,10 +738,11 @@ namespace OpWeave.GraphToolkit
                 Extensions = extensions.Count == 0 ? null : extensions,
             };
             var created = WorkflowDocument.Create(data);
-            // A refused carried item is not emitted and must not be dropped
-            // silently: the successful export carries its refusal
-            // diagnostics so the caller (SaveToFile) can refuse the write
-            // unless the human explicitly overwrites (SPEC §0.6 SG-17).
+            // A refused carried item or a malformed carrier payload is not
+            // emitted and must not be dropped silently: the successful
+            // export carries the diagnostics so the caller (SaveToFile)
+            // can refuse the write unless the human explicitly overwrites
+            // (SPEC §0.6 SG-17).
             return !created.Ok || carriedRefusals.Count == 0
                 ? created
                 : Result<WorkflowDocument>.Success(created.Value!, carriedRefusals);
@@ -744,7 +782,8 @@ namespace OpWeave.GraphToolkit
             INode node,
             string nodeId,
             List<DataEdge> dataEdges,
-            List<InputBinding> inputBindings)
+            List<InputBinding> inputBindings,
+            List<Diagnostic> diagnostics)
         {
             Dictionary<string, JToken>? parameters = null;
             var sources = new List<IPort>();
@@ -785,19 +824,39 @@ namespace OpWeave.GraphToolkit
                                 // as a node; it folds back into the port's
                                 // parameter (SPEC §H7.2 lists constants among
                                 // the assembly API the GUI uses).
-                                if (constant.TryGetValue<OwValue>(out var constantValue) &&
-                                    TryParse(constantValue?.json, out var constantJson))
+                                if (constant.TryGetValue<OwValue>(out var constantValue))
                                 {
-                                    (parameters ??= NewParameters())[port.Name] = constantJson!;
+                                    if (TryParse(constantValue?.json, out var constantJson))
+                                    {
+                                        (parameters ??= NewParameters())[port.Name] = constantJson!;
+                                    }
+                                    else if (!string.IsNullOrEmpty(constantValue?.json))
+                                    {
+                                        diagnostics.Add(MalformedCarrier(
+                                            $"constant node feeding port '{port.Name}' of node '{nodeId}'",
+                                            $"the payload {constantValue!.json} is not parseable JSON",
+                                            nodeId,
+                                            port.Name));
+                                    }
                                 }
                                 break;
                         }
                     }
                 }
-                else if (port.TryGetValue<OwValue>(out var value) &&
-                    TryParse(value?.json, out var json))
+                else if (port.TryGetValue<OwValue>(out var value))
                 {
-                    (parameters ??= NewParameters())[port.Name] = json!;
+                    if (TryParse(value?.json, out var json))
+                    {
+                        (parameters ??= NewParameters())[port.Name] = json!;
+                    }
+                    else if (!string.IsNullOrEmpty(value?.json))
+                    {
+                        diagnostics.Add(MalformedCarrier(
+                            $"constant payload on port '{port.Name}' of node '{nodeId}'",
+                            $"the payload {value!.json} is not parseable JSON",
+                            nodeId,
+                            port.Name));
+                    }
                 }
             }
             return parameters;
@@ -806,8 +865,10 @@ namespace OpWeave.GraphToolkit
         private static Dictionary<string, JToken> NewParameters() =>
             new Dictionary<string, JToken>(StringComparer.Ordinal);
 
-        // The port constant payload is Canonical JSON text (SPEC §H7.2); an
-        // empty or unparseable payload carries no parameter.
+        // The port constant payload is Canonical JSON text (SPEC §H7.2): an
+        // empty payload carries no parameter, and a non-empty unparseable
+        // one is a malformed carrier the caller diagnoses rather than
+        // silently dropping (SPEC §0.6 SG-17).
         private static bool TryParse(string? json, out JToken? token)
         {
             token = null;
@@ -858,34 +919,148 @@ namespace OpWeave.GraphToolkit
             return extras.Count == 0 ? "" : JsonValue.From(extras).CanonicalText;
         }
 
-        private static JObject? ParseExtras(string? extrasJson) =>
-            TryParse(extrasJson, out var token) && token is JObject extras ? extras : null;
+        // The serialized object payload of a node extrasJson, a
+        // carriedJson or a variable's OwValue.json: null for an absent
+        // payload, the parsed object on success, and null plus one
+        // OW-UNITY-002 diagnostic when a present payload is not a
+        // decodable JSON object — its content must never drop silently
+        // (SPEC §0.6 SG-17).
+        private static JObject? ParseObjectPayload(
+            string? json,
+            string carrier,
+            List<Diagnostic> diagnostics,
+            string? nodeId = null)
+        {
+            if (string.IsNullOrEmpty(json))
+            {
+                return null;
+            }
+            var parsed = JsonValue.Parse(json);
+            if (parsed.Ok && parsed.Value!.ToToken() is JObject payloadObject)
+            {
+                return payloadObject;
+            }
+            diagnostics.Add(MalformedCarrier(
+                carrier,
+                parsed.Ok
+                    ? $"the payload {json} is not a JSON object"
+                    : $"the payload {json} is not parseable JSON",
+                nodeId));
+            return null;
+        }
 
-        private static JToken? ParseToken(string? json) =>
-            TryParse(json, out var token) ? token : null;
+        // Reads the graph-level carriedJson string carrier (see
+        // ReadCarried for the member form).
+        private static CarriedContent? ReadCarriedJson(
+            string? json, string carrier, List<Diagnostic> diagnostics) =>
+            ParseObjectPayload(json, carrier, diagnostics) is { } payloadObject
+                ? CarriedContent.FromJson(payloadObject, carrier, diagnostics, null)
+                : null;
 
-        private static void ApplyExtras(NodeData node, JObject? extras)
+        // Reads the "carried" member of a decoded extrasJson carrier: an
+        // absent or explicit-null member carries nothing, while a present
+        // member that is not a decodable JSON object is a malformed
+        // carrier — diagnosed, never read as absent (SPEC §0.6 SG-17).
+        private static CarriedContent? ReadCarried(
+            JToken? token,
+            string carrier,
+            List<Diagnostic> diagnostics,
+            string? nodeId)
+        {
+            if (token is null || token.Type == JTokenType.Null)
+            {
+                return null;
+            }
+            if (token is not JObject payloadObject)
+            {
+                diagnostics.Add(MalformedCarrier(
+                    carrier,
+                    $"the carried payload {token.ToString(Formatting.None)} is not a JSON object",
+                    nodeId));
+                return null;
+            }
+            return CarriedContent.FromJson(payloadObject, carrier, diagnostics, nodeId);
+        }
+
+        // The SG-17 diagnostic one malformed carrier payload produces:
+        // the carrier and the reason it could not be decoded, so a person
+        // can repair the serialized payload — or overwrite explicitly to
+        // drop its content — instead of losing it silently (SPEC §0.6
+        // SG-17). Emitted at the OW-UNITY-002 SPEC §J default severity,
+        // the code the carried-refusal diagnostics already use; a
+        // published code's severity is never overridden.
+        private static Diagnostic MalformedCarrier(
+            string carrier, string detail, string? nodeId = null, string? port = null) =>
+            ErrorCodes.Create(
+                ErrorCodes.OW_UNITY_002,
+                $"Malformed {carrier}: {detail}.",
+                nodeId: nodeId,
+                port: port,
+                hint: "Repair or clear the malformed serialized payload and reload " +
+                    "the JSON, or overwrite explicitly to drop the affected content.");
+
+        // Applies the converter-owned extrasJson members to the node's
+        // exported record. A recognized member present with the wrong
+        // type is carried content the export cannot honor: it is
+        // diagnosed on the shared SG-17 channel, never silently dropped
+        // (SPEC §0.6 SG-17).
+        private static void ApplyExtras(
+            NodeData node, JObject? extras, List<Diagnostic> diagnostics, string nodeId)
         {
             if (extras is null)
             {
                 return;
             }
-            if (extras["label"] is { Type: JTokenType.String } label)
+            var label = extras["label"];
+            if (label is { Type: JTokenType.String })
             {
                 node.Label = (string?)((JValue)label).Value;
             }
-            if (extras["policy"] is JObject policy)
+            else if (label is not null && label.Type != JTokenType.Null)
+            {
+                diagnostics.Add(MalformedCarrier(
+                    $"extras of node '{nodeId}'",
+                    "the \"label\" member is not a string",
+                    nodeId));
+            }
+            var policy = extras["policy"];
+            if (policy is JObject policyObject)
             {
                 node.Policy = new NodePolicy(
-                    OptionalInt(policy["timeoutSeconds"]),
-                    OptionalInt(policy["maxAttempts"]));
+                    OptionalInt(policyObject, "timeoutSeconds", diagnostics, nodeId),
+                    OptionalInt(policyObject, "maxAttempts", diagnostics, nodeId));
+            }
+            else if (policy is not null && policy.Type != JTokenType.Null)
+            {
+                diagnostics.Add(MalformedCarrier(
+                    $"extras of node '{nodeId}'",
+                    "the \"policy\" member is not a JSON object",
+                    nodeId));
             }
         }
 
-        private static int? OptionalInt(JToken? token) =>
-            token is { Type: JTokenType.Integer }
-                ? (int?)Convert.ToInt64(((JValue)token).Value, CultureInfo.InvariantCulture)
-                : null;
+        // A policy timeout/attempts member decodes only as an integer; a
+        // present member of another type is malformed carried content —
+        // diagnosed like every other type-mismatched extras member (SPEC
+        // §0.6 SG-17).
+        private static int? OptionalInt(
+            JObject policy, string name, List<Diagnostic> diagnostics, string nodeId)
+        {
+            var member = policy[name];
+            if (member is null || member.Type == JTokenType.Null)
+            {
+                return null;
+            }
+            if (member.Type == JTokenType.Integer)
+            {
+                return (int?)Convert.ToInt64(((JValue)member).Value, CultureInfo.InvariantCulture);
+            }
+            diagnostics.Add(MalformedCarrier(
+                $"extras of node '{nodeId}'",
+                $"the \"{name}\" member of \"policy\" is not an integer",
+                nodeId));
+            return null;
+        }
 
         private static string EncodeInputPayload(WorkflowInput input, string importToken)
         {
@@ -1373,16 +1548,17 @@ namespace OpWeave.GraphToolkit
                 return json;
             }
 
-            internal static CarriedWire? FromJson(JToken? token)
+            internal static CarriedWire? FromJson(
+                JToken? token, string key, List<string> problems)
             {
                 if (token is not JObject json || json["item"] is not JObject item)
                 {
                     return null;
                 }
                 var wire = new CarriedWire(item);
-                ReadRefs(wire.Nodes, json["nodes"]);
-                ReadRefs(wire.Inputs, json["inputs"]);
-                ReadRefs(wire.Outputs, json["outputs"]);
+                ReadRefs(wire.Nodes, json["nodes"], "nodes", key, problems);
+                ReadRefs(wire.Inputs, json["inputs"], "inputs", key, problems);
+                ReadRefs(wire.Outputs, json["outputs"], "outputs", key, problems);
                 return wire;
             }
 
@@ -1408,12 +1584,30 @@ namespace OpWeave.GraphToolkit
                 json[key] = array;
             }
 
-            private static void ReadRefs(List<string> refs, JToken? token)
+            // A wire's recorded references are an array of string ids. A
+            // member that is not an array or an entry that is not a
+            // string is malformed carried content: it is reported in
+            // <paramref name="problems"/>, never silently skipped (SPEC
+            // §0.6 SG-17).
+            private static void ReadRefs(
+                List<string> refs,
+                JToken? token,
+                string member,
+                string key,
+                List<string> problems)
             {
-                if (token is not JArray array)
+                if (token is null || token.Type == JTokenType.Null)
                 {
                     return;
                 }
+                if (token is not JArray array)
+                {
+                    problems.Add(
+                        $"a carried wire in \"{key}\" has a \"{member}\" member " +
+                        "that is not an array");
+                    return;
+                }
+                var skipped = 0;
                 foreach (var element in array)
                 {
                     if (element is { Type: JTokenType.String } &&
@@ -1421,6 +1615,16 @@ namespace OpWeave.GraphToolkit
                     {
                         refs.Add(id);
                     }
+                    else
+                    {
+                        skipped++;
+                    }
+                }
+                if (skipped != 0)
+                {
+                    problems.Add(
+                        $"a carried wire in \"{key}\" skips {skipped} non-string " +
+                            $"\"{member}\" {(skipped == 1 ? "entry" : "entries")}");
                 }
             }
         }
@@ -1469,20 +1673,32 @@ namespace OpWeave.GraphToolkit
                 return json;
             }
 
-            internal static CarriedContent? FromJson(JToken? token)
+            // Decodes one carrier's serialized content. A recognized member
+            // that cannot be decoded is carried document content the
+            // export cannot re-emit — diagnosed on the shared SG-17
+            // channel, never silently dropped (SPEC §0.6 SG-17).
+            // Unrecognized members are converter-internal and ignored by
+            // design.
+            internal static CarriedContent? FromJson(
+                JObject json,
+                string carrier,
+                List<Diagnostic> diagnostics,
+                string? nodeId)
             {
-                if (token is not JObject json)
-                {
-                    return null;
-                }
+                var problems = new List<string>();
                 var carried = new CarriedContent
                 {
-                    Parameters = json["parameters"] as JObject,
-                    ControlEdges = ReadWires(json["controlEdges"]),
-                    DataEdges = ReadWires(json["dataEdges"]),
-                    InputBindings = ReadWires(json["inputBindings"]),
-                    Outputs = ReadWires(json["outputs"]),
+                    Parameters = ReadParameters(json["parameters"], problems),
+                    ControlEdges = ReadWires(json["controlEdges"], "controlEdges", problems),
+                    DataEdges = ReadWires(json["dataEdges"], "dataEdges", problems),
+                    InputBindings = ReadWires(json["inputBindings"], "inputBindings", problems),
+                    Outputs = ReadWires(json["outputs"], "outputs", problems),
                 };
+                if (problems.Count != 0)
+                {
+                    diagnostics.Add(MalformedCarrier(
+                        carrier, string.Join("; ", problems), nodeId));
+                }
                 return carried.IsEmpty ? null : carried;
             }
 
@@ -1500,19 +1716,50 @@ namespace OpWeave.GraphToolkit
                 json[key] = array;
             }
 
-            private static List<CarriedWire>? ReadWires(JToken? token)
+            private static JObject? ReadParameters(JToken? token, List<string> problems)
             {
-                if (token is not JArray array)
+                if (token is null || token.Type == JTokenType.Null)
                 {
                     return null;
                 }
+                if (token is JObject parameters)
+                {
+                    return parameters;
+                }
+                problems.Add("\"parameters\" is not a JSON object");
+                return null;
+            }
+
+            private static List<CarriedWire>? ReadWires(
+                JToken? token, string key, List<string> problems)
+            {
+                if (token is null || token.Type == JTokenType.Null)
+                {
+                    return null;
+                }
+                if (token is not JArray array)
+                {
+                    problems.Add($"\"{key}\" is not an array of carried wires");
+                    return null;
+                }
                 List<CarriedWire>? wires = null;
+                var undecodable = 0;
                 foreach (var element in array)
                 {
-                    if (CarriedWire.FromJson(element) is { } wire)
+                    if (CarriedWire.FromJson(element, key, problems) is { } wire)
                     {
                         (wires ??= new List<CarriedWire>()).Add(wire);
                     }
+                    else
+                    {
+                        undecodable++;
+                    }
+                }
+                if (undecodable != 0)
+                {
+                    problems.Add(
+                        $"{undecodable} carried {(undecodable == 1 ? "wire" : "wires")} " +
+                            $"in \"{key}\" could not be decoded");
                 }
                 return wires;
             }
@@ -1523,10 +1770,13 @@ namespace OpWeave.GraphToolkit
         // import recorded, so the emitted record names the elements' current
         // ids — a rename keeps the wire, a proven delete drops it, and an
         // ambiguous or unprovable reference refuses it with a
-        // diagnostic instead of guessing. A live wire identical to a
-        // carried one already covers it — drawing the same wire by hand
-        // supersedes the carried copy — and a carried parameter merges only
-        // under a name no live constant claims.
+        // diagnostic instead of guessing, and a resolved wire whose item
+        // no longer decodes as its kind's record is malformed carried
+        // content — diagnosed the same way, never silently dropped. A
+        // live wire identical to a carried one already covers it —
+        // drawing the same wire by hand supersedes the carried copy —
+        // and a carried parameter merges only under a name no live
+        // constant claims.
         private static void EmitCarried(
             CarriedContent carried,
             CarriedIdentity identity,
@@ -1550,6 +1800,9 @@ namespace OpWeave.GraphToolkit
                             controlEdges.Add(renamed);
                         }
                         break;
+                    case WireResolution.Resolved:
+                        diagnostics.Add(MalformedCarriedWire("control edge", wire));
+                        break;
                     case WireResolution.Refused:
                         diagnostics.Add(CarriedRefusal("control edge", wire, reasons));
                         break;
@@ -1567,6 +1820,9 @@ namespace OpWeave.GraphToolkit
                         {
                             dataEdges.Add(renamed);
                         }
+                        break;
+                    case WireResolution.Resolved:
+                        diagnostics.Add(MalformedCarriedWire("data edge", wire));
                         break;
                     case WireResolution.Refused:
                         diagnostics.Add(CarriedRefusal("data edge", wire, reasons));
@@ -1586,6 +1842,9 @@ namespace OpWeave.GraphToolkit
                             inputBindings.Add(renamed);
                         }
                         break;
+                    case WireResolution.Resolved:
+                        diagnostics.Add(MalformedCarriedWire("input binding", wire));
+                        break;
                     case WireResolution.Refused:
                         diagnostics.Add(CarriedRefusal("input binding", wire, reasons));
                         break;
@@ -1604,6 +1863,9 @@ namespace OpWeave.GraphToolkit
                         {
                             outputs.Add(renamed);
                         }
+                        break;
+                    case WireResolution.Resolved:
+                        diagnostics.Add(MalformedCarriedWire("output", wire));
                         break;
                     case WireResolution.Refused:
                         diagnostics.Add(CarriedRefusal("output", wire, reasons));
@@ -1626,6 +1888,20 @@ namespace OpWeave.GraphToolkit
                 hint: "Rename or delete the ambiguous graph elements so every reference " +
                     "resolves uniquely, reload the JSON, or overwrite explicitly to drop " +
                     "the carried item.");
+
+        // The SG-17 diagnostic a resolved carried wire produces when its
+        // verbatim item no longer decodes as its kind's record — a
+        // malformed member such as a non-string endpoint or a non-object
+        // PortRef. Reference resolution proved every element the wire
+        // touched alive, so the undecodable item is malformed carried
+        // content, not a refusal: it is diagnosed on the shared
+        // MalformedCarrier channel, never silently dropped or silently
+        // rewritten (SPEC §0.6 SG-17).
+        private static Diagnostic MalformedCarriedWire(string kind, CarriedWire wire) =>
+            MalformedCarrier(
+                $"carried {kind}",
+                $"the item {JsonValue.From(wire.Item).CanonicalText} does not decode " +
+                    $"as the {kind} record it must hold");
 
         private static string Rename(string recorded, Dictionary<string, string> renames) =>
             renames.TryGetValue(recorded, out var current) ? current : recorded;
@@ -1704,9 +1980,10 @@ namespace OpWeave.GraphToolkit
         {
             var from = StringOf(item["from"]);
             var to = StringOf(item["to"]);
-            return from is null || to is null
+            var fromPort = OptionalString(item, "fromPort", out var malformed);
+            return from is null || to is null || malformed
                 ? null
-                : new ControlEdge(from, to, StringOf(item["fromPort"]) ?? "next");
+                : new ControlEdge(from, to, fromPort ?? "next");
         }
 
         private static DataEdge? DecodeDataEdge(JObject item)
@@ -1727,9 +2004,10 @@ namespace OpWeave.GraphToolkit
         {
             var id = StringOf(item["id"]);
             var from = DecodePortRef(item["from"]);
-            return id is null || from is null
+            var description = OptionalString(item, "description", out var malformed);
+            return id is null || from is null || malformed
                 ? null
-                : new WorkflowOutput(id, from, StringOf(item["description"]));
+                : new WorkflowOutput(id, from, description);
         }
 
         private static PortRef? DecodePortRef(JToken? token)
@@ -1747,5 +2025,19 @@ namespace OpWeave.GraphToolkit
             token is { Type: JTokenType.String }
                 ? (string?)((JValue)token).Value
                 : null;
+
+        // Reads an optional string member of a carried record. An absent
+        // or explicit-null member decodes to null and the record's
+        // documented default applies; a present member of another type is
+        // malformed, so <paramref name="malformed"/> fails the whole
+        // record — the wire is diagnosed rather than silently rewritten
+        // to the default (SPEC §0.6 SG-17).
+        private static string? OptionalString(JObject item, string name, out bool malformed)
+        {
+            var token = item[name];
+            malformed = token is not null && token.Type != JTokenType.Null &&
+                token.Type != JTokenType.String;
+            return StringOf(token);
+        }
     }
 }

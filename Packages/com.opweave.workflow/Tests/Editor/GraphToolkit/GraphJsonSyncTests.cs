@@ -9,9 +9,12 @@
 // the OpWeave.GraphToolkit asmdef is excluded and this file compiles to
 // nothing.
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using NUnit.Framework;
 using OpWeave.Core;
 using OpWeave.Core.Model;
@@ -23,6 +26,7 @@ using OpWeave.UnityAdapter;
 using Unity.GraphToolkit.Editor;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.TestTools;
 
 namespace OpWeave.UnityAdapter.Tests
 {
@@ -1118,6 +1122,342 @@ namespace OpWeave.UnityAdapter.Tests
                 AssertSynced(graph, path, baseline,
                     "the asset save never moves the baseline");
             });
+        }
+
+        // ── T-W5.3-16: the static-seam isolation contract (research B-05) ──
+        //
+        // GraphJsonSync carries its cross-run state in mutable statics.
+        // ClearSyncTestState is the single internal reset entry point
+        // every seam funnels through; SyncSeamOccupancy is the matching
+        // inspection surface. The census below proves the occupancy
+        // table covers every static field the type carries — a static
+        // added without a census entry fails here, so the reset can
+        // never silently lose coverage. The run then populates every
+        // seam, proves the reset empties all of it and proves a second
+        // run sees nothing of the first: no queued check drains, no
+        // remembered decision silently overwrites (SPEC §0.6 SG-17), no
+        // warn-once suppression, no scripted answer, no armed fault
+        // hook and no stale live registration.
+
+        // The full census: every non-const static field of
+        // GraphJsonSync and its declared nested types, mapped to the
+        // occupancy key that proves it cleared — or null for the one
+        // exempt immutable (the shared UTF-8 codec carries no state to
+        // leak). Compiler-generated nested types (display classes,
+        // lambda-delegate caches) hold no declared session state and
+        // are skipped.
+        private static readonly Dictionary<string, string?> ExpectedStaticFields =
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["GraphJsonSync.s_utf8"] = null,
+                ["GraphJsonSync.s_remembered"] = "s_remembered",
+                ["GraphJsonSync.s_warnedIntents"] = "s_warnedIntents",
+                ["GraphJsonSync.s_unsyncedNotified"] = "s_unsyncedNotified",
+                ["GraphJsonSync.<PublishPersistFault>k__BackingField"] =
+                    "PublishPersistFault",
+                ["GraphJsonSync.<AbsenceProbe>k__BackingField"] = "AbsenceProbe",
+                ["GraphJsonSync.<PublishProbe>k__BackingField"] = "PublishProbe",
+                ["GraphJsonSync.<PersistFault>k__BackingField"] = "PersistFault",
+                ["GraphJsonSync.<IntentRecordProbe>k__BackingField"] =
+                    "IntentRecordProbe",
+                ["GraphJsonSync.s_scheduledOpens"] = "s_scheduledOpens",
+                ["GraphJsonSync.s_live"] = "s_live",
+                ["GraphJsonSync.s_pendingOpenChecks"] = "s_pendingOpenChecks",
+                ["GraphJsonSync.OpenCheckRequests"] = "OpenCheckRequests",
+                ["GraphJsonSync.OpenChecksPerformed"] = "OpenChecksPerformed",
+                ["GraphJsonSync.OpenDialogsShown"] = "OpenDialogsShown",
+                ["GraphJsonSync.OpenEnableCount"] = "OpenEnableCount",
+                ["GraphJsonSync.OpenChecksDropped"] = "OpenChecksDropped",
+                ["GraphJsonSync.OpenCheckDropReason"] = "OpenCheckDropReason",
+                ["GraphJsonSync.s_openChoiceProvider"] = "s_openChoiceProvider",
+                ["GraphDirtyMark.s_implementation"] = "GraphDirtyMark",
+                ["GraphDirtyMark.s_setGraphObjectDirty"] = "GraphDirtyMark",
+                ["GraphDirtyMark.s_graphObject"] = "GraphDirtyMark",
+                ["GraphDirtyMark.s_dirty"] = "GraphDirtyMark",
+                ["GraphDirtyMark.s_resolved"] = "GraphDirtyMark",
+            };
+
+        [UnityTest]
+        public IEnumerator StaticSeams_ClearSyncTestState_ClearsAllAndIsolatesRuns()
+        {
+            AssertSeamCensus();
+            var folderCreated = false;
+            var assetCreated = false;
+            var warnings = 0;
+            void OnLog(string condition, string stack, LogType type)
+            {
+                // The invalid-record warnings of ReadIntent — every
+                // message names the "intent record" it leaves untouched.
+                if (type == LogType.Warning && condition.Contains("intent"))
+                {
+                    warnings++;
+                }
+            }
+            Application.logMessageReceived += OnLog;
+            try
+            {
+                if (!AssetDatabase.IsValidFolder(TempDir))
+                {
+                    AssetDatabase.CreateFolder("Assets", "GraphJsonSyncTests");
+                    folderCreated = true;
+                }
+                if (AssetDatabase.LoadMainAssetAtPath(TempPath) is not null)
+                {
+                    AssetDatabase.DeleteAsset(TempPath);
+                }
+                DeleteSiblingJson();
+                var created = GraphDatabase.CreateGraph<OpWeaveGraph>(TempPath);
+                assetCreated = created is not null;
+                Assert.IsNotNull(created, "GraphDatabase.CreateGraph must return a graph");
+                var graph = created!;
+
+                var path = JsonPath("seams.opweave.json");
+                ImportAndLink(graph, path);
+
+                // A clean automatic save reconciles and persists — the
+                // persist resolves the dirty-mark reflection cache.
+                var clean = GraphJsonSync.Save(graph, null);
+                Assert.AreEqual(GraphJsonSyncOutcome.Saved, clean.Outcome,
+                    "the unchanged save reconciles and persists");
+
+                // Edits the JSON does not hold yet — the unsynced-edits
+                // state the verified reopen notification reports.
+                Assert.IsTrue(GraphJsonConverter.Import(
+                    graph,
+                    FixtureSync.Replace(
+                        "\"name\": \"Alpha\"", "\"name\": \"Edited\"")).Ok);
+
+                var providerCalls = 0;
+                GraphJsonSync.OpenChoiceProvider = _ =>
+                {
+                    providerCalls++;
+                    return GraphJsonSyncChoice.Cancel;
+                };
+
+                // The drain on the unchanged file performs the queued
+                // check and emits the one-per-key unsynced-edits
+                // notification.
+                yield return EditorSettled();
+                var guid = AssetDatabase.AssetPathToGUID(TempPath);
+                var coordinator = TestCoordinator();
+                var intentPath = coordinator.IntentPathFor(guid);
+                GraphJsonSync.OnGraphEnabled(graph);
+                yield return DrainOpenChecks(
+                    guid, PerformedOf(guid), DroppedOf(guid));
+
+                // A diverged file: the explicit save's first prompt
+                // answers Overwrite, a mid-prompt rewrite invalidates
+                // the bound revision and the second prompt cancels —
+                // leaving the (P, R, output, B) → Overwrite decision
+                // remembered but never applied.
+                var diverged = FixtureSync.Replace(
+                    "\"name\": \"Alpha\"", "\"name\": \"Diverged\"");
+                var diverged2 = FixtureSync.Replace(
+                    "\"name\": \"Alpha\"", "\"name\": \"Diverged2\"");
+                File.WriteAllText(path, diverged);
+                var prompts = 0;
+                var cancelled = GraphJsonSync.Save(graph, check =>
+                {
+                    prompts++;
+                    if (prompts == 1)
+                    {
+                        File.WriteAllText(path, diverged2);
+                        return GraphJsonSyncChoice.OverwriteJson;
+                    }
+                    return GraphJsonSyncChoice.Cancel;
+                });
+                Assert.AreEqual(GraphJsonSyncOutcome.Cancelled, cancelled.Outcome);
+                Assert.AreEqual(2, prompts,
+                    "the invalidated overwrite reprompts on the new revision");
+
+                // A drain on the divergence performs the check and
+                // shows the scripted dialog.
+                yield return EditorSettled();
+                GraphJsonSync.OnGraphEnabled(graph);
+                yield return DrainOpenChecks(
+                    guid, PerformedOf(guid), DroppedOf(guid));
+                Assert.AreEqual(1, providerCalls,
+                    "the conflict drain asked the installed provider once");
+
+                // A queued check swept by the disable records the drop;
+                // the final enable leaves the queue, the dedupe set and
+                // the live registry populated for the reset.
+                yield return EditorSettled();
+                GraphJsonSync.OnGraphEnabled(graph);
+                GraphJsonSync.OnGraphDisabled(graph);
+                GraphJsonSync.OnGraphEnabled(graph);
+
+                // An unreadable intent record warns once and the save
+                // is refused.
+                Directory.CreateDirectory(Path.GetDirectoryName(intentPath)!);
+                File.WriteAllText(intentPath, "{ not valid intent");
+                var refused = GraphJsonSync.Save(graph, null);
+                Assert.AreEqual(GraphJsonSyncOutcome.Refused, refused.Outcome);
+                Assert.AreEqual(1, warnings, "an invalid intent warns once");
+
+                // Every fault seam armed.
+                GraphJsonSync.PublishPersistFault = _ => { };
+                GraphJsonSync.AbsenceProbe = _ => { };
+                GraphJsonSync.PublishProbe = _ => { };
+                GraphJsonSync.PersistFault = _ => { };
+                GraphJsonSync.IntentRecordProbe = _ => { };
+
+                AssertAllSeamsPopulated("after population");
+
+                GraphJsonSync.ClearSyncTestState();
+                AssertAllSeamsClear("after ClearSyncTestState");
+
+                // A cleared queue drains nothing: the still-held intent
+                // would answer a stale queued check with a refused
+                // result.
+                var drained = GraphJsonSync.RunPendingOpenChecks();
+                Assert.AreEqual(0, drained.Count,
+                    "a cleared queue must not drain a previous run's check");
+                AssertAllSeamsClear("after the post-reset drain");
+
+                // The warn-once set must not suppress the second run's
+                // report of the same invalid record.
+                var again = GraphJsonSync.Save(graph, null);
+                Assert.AreEqual(GraphJsonSyncOutcome.Refused, again.Outcome);
+                Assert.AreEqual(2, warnings,
+                    "the invalid intent must warn again after the reset");
+
+                // A remembered decision must not survive: the exact
+                // (P, R, output, B) request the first run remembered as
+                // Overwrite stays refused as an automatic write — a
+                // leaked map would overwrite the file silently
+                // (SPEC §0.6 SG-17).
+                File.Delete(intentPath);
+                File.WriteAllText(path, diverged);
+                var automatic = GraphJsonSync.Save(graph, null);
+                Assert.AreEqual(GraphJsonSyncOutcome.Refused, automatic.Outcome,
+                    "a leaked remembered Overwrite would have applied silently");
+                Assert.AreEqual(diverged, File.ReadAllText(path),
+                    "the automatic attempt touches nothing");
+
+                // The second run is independent: a fresh enable and
+                // drain count from zero, and the cleared provider does
+                // not answer — the drain's conflict prompt falls back
+                // to the production default (the batch Cancel), so the
+                // scripted answer the first run installed stays called
+                // exactly once. A provider that survived the reset
+                // would be asked here and the count would reach two.
+                yield return EditorSettled();
+                GraphJsonSync.OnGraphEnabled(graph);
+                yield return DrainOpenChecks(
+                    guid, PerformedOf(guid), DroppedOf(guid));
+                Assert.AreEqual(1, RequestsOf(guid));
+                Assert.AreEqual(1, EnablesOf(guid));
+                Assert.AreEqual(1, PerformedOf(guid));
+                Assert.AreEqual(1, TotalDialogs());
+                Assert.AreEqual(1, providerCalls,
+                    "a leaked choice provider would answer the second drain's prompt");
+            }
+            finally
+            {
+                Application.logMessageReceived -= OnLog;
+                GraphJsonSync.OpenChoiceProvider = null;
+                if (assetCreated)
+                {
+                    AssetDatabase.DeleteAsset(TempPath);
+                }
+                DeleteSiblingJson();
+                if (folderCreated)
+                {
+                    AssetDatabase.DeleteAsset(TempDir);
+                }
+            }
+        }
+
+        // The census assertion: every static field reflection finds on
+        // GraphJsonSync or a declared nested type must be a mapped seam
+        // or the exempt immutable, and the occupancy table must
+        // enumerate exactly the mapped seam keys.
+        private static void AssertSeamCensus()
+        {
+            var found = new List<string>();
+            var pending = new Queue<Type>();
+            pending.Enqueue(typeof(GraphJsonSync));
+            while (pending.Count != 0)
+            {
+                var type = pending.Dequeue();
+                foreach (var field in type.GetFields(
+                    BindingFlags.Static | BindingFlags.Public |
+                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                {
+                    if (!field.IsLiteral)
+                    {
+                        found.Add(type.Name + "." + field.Name);
+                    }
+                }
+                foreach (var nested in type.GetNestedTypes(
+                    BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (nested.GetCustomAttribute<CompilerGeneratedAttribute>() is null)
+                    {
+                        pending.Enqueue(nested);
+                    }
+                }
+            }
+            CollectionAssert.AreEquivalent(
+                ExpectedStaticFields.Keys, found,
+                "a static field without a census entry escapes the reset's coverage");
+            CollectionAssert.AreEquivalent(
+                ExpectedStaticFields.Values
+                    .Where(key => key is not null).Distinct().ToList(),
+                GraphJsonSync.SyncSeamOccupancy().Keys,
+                "the occupancy table must enumerate exactly the covered seams");
+        }
+
+        // Every occupancy entry holds state — the populated side of the
+        // isolation proof: the reset is only meaningful if nothing below
+        // started empty.
+        private static void AssertAllSeamsPopulated(string when)
+        {
+            foreach (var pair in GraphJsonSync.SyncSeamOccupancy())
+            {
+                Assert.Greater(pair.Value, 0,
+                    "seam " + pair.Key + " must hold state " + when);
+            }
+        }
+
+        // Every occupancy entry is empty and every inspectable seam
+        // reads as a fresh session — the cleared side of the proof.
+        private static void AssertAllSeamsClear(string when)
+        {
+            foreach (var pair in GraphJsonSync.SyncSeamOccupancy())
+            {
+                Assert.AreEqual(0, pair.Value,
+                    "seam " + pair.Key + " must be empty " + when);
+            }
+            Assert.IsNull(GraphJsonSync.OpenChoiceProvider,
+                "the installed choice provider must not survive " + when);
+            Assert.IsNull(GraphJsonSync.PublishPersistFault, when);
+            Assert.IsNull(GraphJsonSync.AbsenceProbe, when);
+            Assert.IsNull(GraphJsonSync.PublishProbe, when);
+            Assert.IsNull(GraphJsonSync.PersistFault, when);
+            Assert.IsNull(GraphJsonSync.IntentRecordProbe, when);
+            Assert.AreEqual(0, GraphJsonSync.LiveGraphs().Count,
+                "no live registration may survive " + when);
+        }
+
+        // Pumps editor frames until the editor leaves every transition
+        // the open-check request skips — an in-flight import, compile or
+        // play-mode change makes ScheduleOpenCheck and the drain defer,
+        // so an enable must wait for a settled editor the way the
+        // production delayCall does.
+        private static IEnumerator EditorSettled()
+        {
+            var deadline = EditorApplication.timeSinceStartup + 10.0;
+            while (EditorApplication.isPlayingOrWillChangePlaymode ||
+                EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                if (EditorApplication.timeSinceStartup >= deadline)
+                {
+                    Assert.Fail("the editor never settled for the seam test");
+                }
+                yield return null;
+            }
         }
 
         // ── helpers ─────────────────────────────────────────────────────────
