@@ -50,6 +50,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using NUnit.Framework;
 using OpWeave.Core;
 using OpWeave.Core.Compiler;
@@ -234,21 +235,355 @@ namespace OpWeave.UnityAdapter.Tests
             return dirty;
         }
 
+        // ── T-W2.4-08: conditional drain + session-token probe ─────────────
+        //
+        // The [UnitySetUp]/[UnityTearDown] reload emitters this replaces —
+        // `yield return new RecompileScripts(false)` on a dirty cleanup —
+        // opened two stale-PC vectors: its Perform unlocks the runner's
+        // run-wide assembly-reload lock even when nothing is queued, and
+        // UTF's PrepareForDomainReload records the CURRENT test
+        // enumerator's program counter on every ExpectDomainReload yield —
+        // including one emitted inside setup/teardown — and applies that
+        // stale PC to the next test method's fresh enumerator, jumping it
+        // past a whole phase into a silent PASS. The drain below crosses a
+        // pending compile/reload only at the bounded DrainedScriptReload
+        // boundary, once the pending state is proven, and hands the next
+        // fixture a quiet Editor; the per-phase session-token probe turns
+        // a stale-PC landing that skipped a phase into a loud PhaseResult
+        // failure instead of a skipped one (the At01AgentStepsTests /
+        // ChangeSetDomainReloadTests sanctioned pattern).
+
+        // The bound shared by the drain waits — the suite-wide convention
+        // (240 s) — and the sustained-idle window the drain demands before
+        // it trusts a quiet Editor (the QuietSettle convention).
+        private const double WaitTimeoutSec = 240.0;
+        private const double QuietSettleSec = 5.0;
+
+        // A per-Editor-session token stored in SessionState and written
+        // into the probe file beside each completed phase's label; the
+        // next phase's gate reads both to prove the phase chain belongs
+        // to this session — never residue of an earlier run. The file
+        // lives under StateDir, which CleanupProbeArtifacts already
+        // removes.
+        private const string ProbeTokenKey =
+            "OpWeave.W2408.PlanInvalidation.ProbeToken";
+
+        private static string ProbeTokenFile =>
+            Path.Combine(StateDir, "reload-probe.txt");
+
+        // Stamps the token file with the just-completed phase label. The
+        // session token is minted once — its presence in SessionState at
+        // the next phase's gate proves that gate runs in the same Editor
+        // session the earlier phase wrote it in.
+        private static void WriteProbeToken(string phase)
+        {
+            var token = SessionState.GetString(ProbeTokenKey, "");
+            if (token.Length == 0)
+            {
+                token = Guid.NewGuid().ToString("N");
+                SessionState.SetString(ProbeTokenKey, token);
+            }
+            Directory.CreateDirectory(StateDir);
+            File.WriteAllText(ProbeTokenFile, phase + "\n" + token + "\n");
+            Crumb("probe stamped: " + phase +
+                " reloads=" + DomainReloadCounter.Current);
+        }
+
+        // The phase-entry gate: returns a failing PhaseResult when the
+        // token file does not show expectedPhase stamped this session —
+        // so a stale-resume landing that skipped phases reports loudly,
+        // never a silent continuation.
+        private static PhaseResult? VerifyProbeToken(
+            string expectedPhase, string forPhase)
+        {
+            var token = SessionState.GetString(ProbeTokenKey, "");
+            if (token.Length == 0)
+            {
+                return PhaseResult.Fail(forPhase +
+                    ": phase-1 never executed in this Editor session " +
+                    "(no session probe token)");
+            }
+            if (!File.Exists(ProbeTokenFile))
+            {
+                return PhaseResult.Fail(forPhase +
+                    ": the persisted reload probe " + ProbeTokenFile +
+                    " was deleted after " + expectedPhase + " wrote it");
+            }
+            var lines = File.ReadAllLines(ProbeTokenFile);
+            if (lines.Length < 2 || lines[1] != token)
+            {
+                return PhaseResult.Fail(forPhase +
+                    ": the persisted reload probe is stale — a previous " +
+                    "session wrote " + ProbeTokenFile);
+            }
+            if (lines[0] != expectedPhase)
+            {
+                return PhaseResult.Fail(forPhase +
+                    ": the probe file shows " + lines[0] + ", expected " +
+                    expectedPhase + " — an intervening phase never executed");
+            }
+            Crumb("probe verified: " + forPhase + " sees " + expectedPhase +
+                " reloads=" + DomainReloadCounter.Current);
+            return null;
+        }
+
+        // The pending-request flag WaitForDomainReload.Perform polls —
+        // Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the drain
+        // reaches it through reflection (the PackageAddUpmTests probe). A
+        // reload already armed behind the runner's reload lock surfaces
+        // here while isCompiling is false — the deferred state an
+        // isCompiling-only check misses and hands to the next fixture.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    BindingFlags.Static | BindingFlags.Instance |
+                    BindingFlags.Public | BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        // The state a queued compile/reload reports while the runner's
+        // lock holds it: a running script compile always ends in a reload
+        // queued behind the lock, and a requested reload is already
+        // pending — either is one the drain must cross, never forward.
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
+
+        // The pending probe the drain trusts is only as strong as its
+        // shape: prove it once up front (the At01AgentStepsTests pattern)
+        // so the fixture fails here — before any test — instead of
+        // silently degrading to an isCompiling-only check that re-opens
+        // the missed-request race the probe exists to close.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "this Unity version — the setup/teardown cannot prove a " +
+                    "deferred reload is drained");
+            }
+        }
+
+        // The contract the fixture hands the next suite test: no pending
+        // script reload, no compile or import in flight and a clean
+        // compile — the failure mode this drain replaces was the
+        // `yield return new RecompileScripts(false)` cleanup emitter: its
+        // Perform unlocks the runner's reload lock even when nothing is
+        // queued, and with no reload following the lock stays released,
+        // so the next fixture's real reload crosses mid-pump on the stale
+        // armed state. Here a pending compile or requested reload is
+        // crossed only at DrainedScriptReload — the bounded instruction
+        // that unlocks once the pending state is proven — and everything
+        // else settles on bounded plain frames. A queued compile surfaces
+        // as isCompiling a frame or two after Refresh returns, so the
+        // wait only trusts a sustained quiet spell (the QuietSettle
+        // convention): quiet flags reset on every busy frame and a
+        // periodic Refresh flushes the import queue so a queued compile
+        // surfaces inside the window, never behind it. The instruction
+        // the nested enumerator produces is yielded DIRECTLY from the
+        // setup/teardown's own top level through the caller's MoveNext
+        // relay — a nested yield would never reach Perform — and the whole
+        // sequence is idempotent: a crossed reload resumes the caller's
+        // enumerator at its yield with every local reset, so the caller
+        // rebuilds the drain when it arrives null rather than relaying a
+        // dead reference.
+        private static IEnumerator DrainEditorState(string phase)
+        {
+            AssetDatabase.Refresh();
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            var quietAt = -1.0;
+            for (;;)
+            {
+                if (EditorApplication.timeSinceStartup >= deadline)
+                {
+                    Assert.Fail(
+                        "PlanInvalidationTests." + phase +
+                        " timed out after " + WaitTimeoutSec +
+                        " s draining the armed editor state " +
+                        "(scriptReloadRequested: " + ScriptReloadRequested() +
+                        ", isCompiling: " + EditorApplication.isCompiling +
+                        ", isUpdating: " + EditorApplication.isUpdating + ")");
+                }
+                if (ReloadPending())
+                {
+                    // A running or requested compile ends in a reload
+                    // queued behind the runner's lock — cross it at the
+                    // bounded sanctioned boundary, never hand it on.
+                    quietAt = -1.0;
+                    yield return new DrainedScriptReload(
+                        phase, WaitTimeoutSec);
+                    continue;
+                }
+                if (EditorApplication.isUpdating)
+                {
+                    // An import still in flight may surface a compile —
+                    // no quiet counts while it runs.
+                    quietAt = -1.0;
+                }
+                else if (quietAt < 0.0)
+                {
+                    quietAt = EditorApplication.timeSinceStartup;
+                }
+                else if (EditorApplication.timeSinceStartup - quietAt >=
+                         QuietSettleSec)
+                {
+                    break;
+                }
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+            AssertDrainedEditorState(phase);
+        }
+
+        // The terminal clean-state proof: the project compiled clean, no
+        // compile in flight and no script reload still armed behind the
+        // runner's lock — a leftover here is this fixture's failure,
+        // never a later suite index's.
+        private static void AssertDrainedEditorState(string phase)
+        {
+            Assert.IsFalse(EditorUtility.scriptCompilationFailed,
+                "PlanInvalidationTests." + phase +
+                ": the project did not compile clean");
+            Assert.IsFalse(EditorApplication.isCompiling,
+                "PlanInvalidationTests." + phase +
+                ": a script compile is still running");
+            Assert.IsFalse(ScriptReloadRequested(),
+                "PlanInvalidationTests." + phase +
+                ": a script reload is still pending");
+        }
+
+        // The bounded reload-crossing instruction — the
+        // WaitForDomainReload.Perform wait with a deadline, run by UTF
+        // through the IEditModeTestYieldInstruction interface so
+        // ExpectDomainReload arms the runner's reload bookkeeping
+        // exactly as with UTF's own instructions. It is yielded only
+        // after ReloadPending() proved a real reload is armed, so the
+        // unlock below always meets a queued reload and can never strand
+        // the lock released on an idle Editor — the failure mode of the
+        // unconditional RecompileScripts(false) unlock it replaces. The
+        // one path where no reload can follow — a failed compile —
+        // re-locks before failing.
+        private sealed class DrainedScriptReload : IEditModeTestYieldInstruction
+        {
+            private readonly string m_phase;
+            private readonly double m_timeoutSec;
+
+            internal DrainedScriptReload(string phase, double timeoutSec)
+            {
+                m_phase = phase;
+                m_timeoutSec = timeoutSec;
+            }
+
+            public bool ExpectDomainReload => true;
+            public bool ExpectedPlaymodeState => false;
+
+            public IEnumerator Perform()
+            {
+                // UTF yields the same first frame: the runner must see
+                // the yielded instruction and arm its expected-domain-
+                // reload bookkeeping before the reload can start.
+                yield return null;
+
+                var deadline =
+                    EditorApplication.timeSinceStartup + m_timeoutSec;
+
+                AssetDatabase.Refresh();
+                EditorApplication.UnlockReloadAssemblies();
+
+                // Wait out the armed state as WaitForDomainReload.Perform
+                // does — while a script reload stays requested or a
+                // compile runs — but bounded: the reload itself kills
+                // the domain mid-wait, so a deadline expiry can only
+                // mean the proven pending state never crossed.
+                while (ReloadPending())
+                {
+                    if (EditorApplication.timeSinceStartup >= deadline)
+                    {
+                        EditorApplication.LockReloadAssemblies();
+                        Assert.Fail(
+                            "PlanInvalidationTests." + m_phase +
+                            " timed out after " + m_timeoutSec +
+                            " s: the proven pending reload never crossed");
+                    }
+                    yield return null;
+                }
+
+                if (EditorUtility.scriptCompilationFailed)
+                {
+                    EditorApplication.LockReloadAssemblies();
+                    Assert.Fail(
+                        "PlanInvalidationTests." + m_phase +
+                        ": script compilation failed");
+                }
+            }
+        }
+
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            if (CleanupProbeArtifacts())
+            Crumb("setup cleanup enter");
+            var dirty = CleanupProbeArtifacts();
+            Crumb("setup cleanup exit; assetsDirty=" + dirty);
+            // UTF resumes a reload-crossed setup enumerator at its yield
+            // with every local reset — a null drain is that resume, not a
+            // fresh start: rebuild the idempotent drain and relay on
+            // instead of touching the dead reference.
+            IEnumerator? drain = null;
+            for (;;)
             {
-                yield return new RecompileScripts(false);
+                drain ??= DrainEditorState(nameof(UnitySetUp));
+                if (!drain.MoveNext())
+                {
+                    break;
+                }
+                yield return drain.Current;
             }
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            if (CleanupProbeArtifacts())
+            s_domainSentinel = null;
+            Crumb("teardown cleanup enter");
+            var dirty = CleanupProbeArtifacts();
+            Crumb("teardown cleanup exit; assetsDirty=" + dirty);
+            // UTF resumes a reload-crossed teardown enumerator at its
+            // yield with every local reset — a null drain is that resume,
+            // not a fresh start: rebuild the idempotent drain and relay
+            // on instead of touching the dead reference.
+            IEnumerator? drain = null;
+            for (;;)
             {
-                yield return new RecompileScripts(false);
+                drain ??= DrainEditorState(nameof(UnityTearDown));
+                if (!drain.MoveNext())
+                {
+                    break;
+                }
+                yield return drain.Current;
             }
             if (!EditorUtility.scriptCompilationFailed && !EditorApplication.isCompiling)
             {
@@ -409,6 +744,7 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 WriteProbeAssets();
                 ArmDomainSentinel();
+                WriteProbeToken("phase-1");
                 Crumb("phase-1 complete: probe assemblies written, sentinel armed");
                 return PhaseResult.Pass();
             }
@@ -429,6 +765,12 @@ namespace OpWeave.UnityAdapter.Tests
         // the next domain.
         private static PhaseResult RunPhaseBaseline()
         {
+            var probeFailure = VerifyProbeToken("phase-1", "phase-2");
+            if (probeFailure is not null)
+            {
+                Crumb("phase-2 probe gate failed: " + probeFailure.Failure);
+                return probeFailure;
+            }
             try
             {
                 var build = Rebuild();
@@ -457,6 +799,7 @@ namespace OpWeave.UnityAdapter.Tests
 
                 EditBeta(variant: 1);
                 ArmDomainSentinel();
+                WriteProbeToken("phase-2");
                 Crumb("phase-2 complete: baseline persisted, B edited, sentinel armed");
                 return PhaseResult.Pass();
             }
@@ -472,6 +815,12 @@ namespace OpWeave.UnityAdapter.Tests
         // arming the sentinel.
         private static PhaseResult RunPhaseUsedAssemblyChanged()
         {
+            var probeFailure = VerifyProbeToken("phase-2", "phase-3");
+            if (probeFailure is not null)
+            {
+                Crumb("phase-3 probe gate failed: " + probeFailure.Failure);
+                return probeFailure;
+            }
             try
             {
                 var afterBeta = Rebuild();
@@ -491,6 +840,7 @@ namespace OpWeave.UnityAdapter.Tests
 
                 EditGamma(variant: 1);
                 ArmDomainSentinel();
+                WriteProbeToken("phase-3");
                 Crumb("phase-3 complete: same-DLL invalidation proven, C edited," +
                     " sentinel armed");
                 return PhaseResult.Pass();
@@ -512,6 +862,12 @@ namespace OpWeave.UnityAdapter.Tests
         // used type carries) and arming the sentinel.
         private static PhaseResult RunPhaseUnrelatedAssemblyChanged()
         {
+            var probeFailure = VerifyProbeToken("phase-3", "phase-4");
+            if (probeFailure is not null)
+            {
+                Crumb("phase-4 probe gate failed: " + probeFailure.Failure);
+                return probeFailure;
+            }
             try
             {
                 var afterGamma = Rebuild();
@@ -531,6 +887,7 @@ namespace OpWeave.UnityAdapter.Tests
 
                 EditCodec(variant: 1);
                 ArmDomainSentinel();
+                WriteProbeToken("phase-4");
                 Crumb("phase-4 complete: preserved Plan accepted, Codec edited," +
                     " sentinel armed");
                 return PhaseResult.Pass();
@@ -546,6 +903,12 @@ namespace OpWeave.UnityAdapter.Tests
         // revalidate the Plans using them).
         private static PhaseResult RunPhaseUsedCodecChanged()
         {
+            var probeFailure = VerifyProbeToken("phase-4", "phase-5");
+            if (probeFailure is not null)
+            {
+                Crumb("phase-5 probe gate failed: " + probeFailure.Failure);
+                return probeFailure;
+            }
             try
             {
                 var afterCodec = Rebuild();
@@ -556,6 +919,7 @@ namespace OpWeave.UnityAdapter.Tests
                 AssertPlanHashMismatch(
                     AcceptWithExpectedPlanHash(planCodec, codecBaseline.PlanHash),
                     codecBaseline.PlanHash, planCodec);
+                WriteProbeToken("phase-5");
                 Crumb("phase-5 complete: used-Codec invalidation proven");
                 return PhaseResult.Pass();
             }

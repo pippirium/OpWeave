@@ -1952,15 +1952,24 @@ namespace OpWeave.UnityAdapter.Tests
             return MayRequest(boundaryId);
         }
 
+        // The install wait: a Client.Add request is asynchronous
+        // real-time work — a git resolution queued on a still-settling
+        // post-reload domain only begins once the editor is quiet, so
+        // the wait is bounded by wall clock like every other settle in
+        // the class, never by a frame count (unthrottled batchmode
+        // frames expire in seconds). A genuine stall still fails loud
+        // and names the manifest evidence the request left behind.
         private static IEnumerator WaitForInstallRegistered()
         {
-            var guard = 0;
-            while (!PackageInstalled(FixturePackage) && guard++ < 12000)
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            while (!PackageInstalled(FixturePackage) &&
+                   EditorApplication.timeSinceStartup < deadline)
             {
                 yield return null;
             }
             Assert.IsTrue(PackageInstalled(FixturePackage),
-                "the fixture install never registered the package");
+                "the fixture install never registered the package " +
+                "(manifest dep: " + (ManifestDep(FixturePackage) ?? "<none>") + ")");
         }
 
         // ---------- the production Operation, wired for the fixture ----------
@@ -2002,6 +2011,13 @@ namespace OpWeave.UnityAdapter.Tests
         // domain; the counting seam is armed before the recovering
         // phase registers it.
         private static int s_issueCalls;
+
+        // The moved-tag compare runs inside a synchronously-invoked
+        // phase delegate; a static keeps the value out of the
+        // resumable body's display class — a lambda over a resumable
+        // local is the <>8__N hole the domain-reload serializer
+        // restores as null.
+        private static string? s_taggedSha;
 
         private static JsonValue CountingIssueClientAdd(string id)
         {
@@ -2713,6 +2729,13 @@ namespace OpWeave.UnityAdapter.Tests
                 "the marker compile did not produce a domain reload");
             NoteDomainReload("mid");
 
+            // The re-executed Execute issues its Client.Add inside this
+            // domain — let the post-reload project refresh drain first
+            // so the request resolves on a quiet editor instead of
+            // queueing behind the settle (the same pause the domain-0
+            // half takes before the mid-phase cut).
+            yield return WaitForIdleQuiet();
+
             var after = GitAddPhaseAfter(
                 "phase-2", IssueClientAdd, recordToken: false,
                 (fixture, runId, _) =>
@@ -2834,13 +2857,14 @@ namespace OpWeave.UnityAdapter.Tests
             BeginTest();
             var (tagged, _) = EnsureFixtures();
             var dep = DepFor(TagMoved);
+            s_taggedSha = tagged;
             AssertPhase(
                 GitAddPhase(
                     dep,
-                    id =>
+                    static id =>
                     {
                         var moved = MoveTagToHead();
-                        Assert.That(moved, Is.Not.EqualTo(tagged),
+                        Assert.That(moved, Is.Not.EqualTo(s_taggedSha),
                             "the tag must move to a different commit");
                         return IssueClientAdd(id);
                     }),
@@ -2909,7 +2933,8 @@ namespace OpWeave.UnityAdapter.Tests
             AssertPhase(
                 GitAddMidPhase(
                     Cut.StartedOnly,
-                    () => WriteManifestDependency(FixturePackage, dep),
+                    static () => WriteManifestDependency(
+                        FixturePackage, MissingDepFor(ReloadTaggedSha())),
                     expectInstalled: false),
                 "mid");
             if (ReloadRequestNeeded("mid"))

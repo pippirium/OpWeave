@@ -161,8 +161,12 @@ namespace OpWeave.Operations
                 return read.Diagnostics[0];
             }
             var path = read.Value!;
+            // SPEC §D8 item 1: a pending edge-fed port has no value to
+            // inspect on the Dry-Run path, so it takes the declared default
+            // exactly like a missing port does.
             single = string.Equals(
-                ctx.IsPresent(SceneOps.ModePort)
+                ctx.IsPresent(SceneOps.ModePort) &&
+                    !ctx.IsPending(SceneOps.ModePort)
                     ? ctx.Get<string>(SceneOps.ModePort)
                     : SceneOps.ModeSingle,
                 SceneOps.ModeSingle, StringComparison.Ordinal);
@@ -179,7 +183,10 @@ namespace OpWeave.Operations
             }
             if (single && SceneOps.DirtyScenes().Count > 0)
             {
-                var mode = ctx.IsPresent(SceneOps.DirtyScenesPort)
+                // A pending dirtyScenes is edge-fed (§D8): the "fail"
+                // default answers the check it cannot be read for.
+                var mode = ctx.IsPresent(SceneOps.DirtyScenesPort) &&
+                    !ctx.IsPending(SceneOps.DirtyScenesPort)
                     ? ctx.Get<string>(SceneOps.DirtyScenesPort)
                     : SceneOps.DirtyScenesFail;
                 if (!string.Equals(mode, SceneOps.DirtyScenesSave, StringComparison.Ordinal))

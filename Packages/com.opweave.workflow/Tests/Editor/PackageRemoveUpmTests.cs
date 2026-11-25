@@ -231,6 +231,7 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 ["snapshot"] = snapshot.ToToken(),
                 ["reloads"] = DomainReloadCounter.Current,
+                ["session"] = ArmProbeNonce(),
             };
             if (tokenJson is not null)
             {
@@ -287,6 +288,142 @@ namespace OpWeave.UnityAdapter.Tests
                 _ => verdict?.ToString() ?? "null",
             };
 
+        // ---------- pending-reload proof + per-session identity ----------
+
+        // The same pending-request flag WaitForDomainReload.Perform
+        // polls — Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the wait
+        // reaches it through reflection. A reload already armed behind
+        // the runner's reload lock surfaces here while isCompiling is
+        // false, which is exactly the deferred state the quiet window
+        // missed. The probe is resolved deterministically from the
+        // UnityEditor assembly and its shape is proven once at fixture
+        // start: a Unity version without it fails the fixture outright —
+        // there is no isCompiling-only fallback.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly System.Reflection.MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    System.Reflection.BindingFlags.Static |
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
+
+        // The pending proof WaitForDomainReload needs before it is
+        // yielded: its Perform throws the moment neither flag is set, so
+        // the instruction may only be armed once a reload is provably
+        // queued — a requested script reload, or an in-flight compile
+        // that ends in one. The wait only waits — it never throws and
+        // never yields an edit-mode yield instruction, which a nested
+        // enumerator is not allowed to yield; the caller checks
+        // ReloadPending() afterwards so teardown can record a timeout
+        // and still drain the reloads the failure left queued.
+        private static IEnumerator WaitForReloadPending()
+        {
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            while (!ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+        }
+
+        private static string ReloadTimeoutMessage(string what) =>
+            "no domain reload became pending within " + WaitTimeoutSec +
+            " s of " + what;
+
+        // The per-Editor-session resume-owner record behind each body
+        // boundary: armed only by this test's own pre-boundary statement
+        // and SessionState-mirrored across the reload, so a continuation
+        // UTF resumes on a stale enumerator position — one that never
+        // ran the arming segment — finds the previous test's mark or
+        // none and fails the boundary check closed instead of silently
+        // continuing into the post-reload phase.
+        private const string BoundaryOwnerSessionKey =
+            "OpWeave.PackageRemove.boundary-owner";
+
+        private static string CurrentTestFullName =>
+            TestContext.CurrentContext.Test.FullName ??
+            TestContext.CurrentContext.Test.Name ?? "unknown";
+
+        private static void ArmBoundary(string boundaryId) =>
+            SessionState.SetString(
+                BoundaryOwnerSessionKey,
+                CurrentTestFullName + "|" + boundaryId);
+
+        private static void AssertBoundaryOwned(string boundaryId)
+        {
+            var owner = SessionState.GetString(BoundaryOwnerSessionKey, "");
+            Assert.That(
+                owner,
+                Is.EqualTo(CurrentTestFullName + "|" + boundaryId),
+                "the \"" + boundaryId + "\" reload boundary was not armed by " +
+                "this test in this Editor session (armed: \"" + owner +
+                "\") — the continuation resumed on a stale position");
+        }
+
+        // The persisted evidence's session identity: PersistState writes
+        // the nonce into the file's "session" member AND SessionState —
+        // both survive the reload, so post-reload phases prove the file
+        // belongs to this session's arm (a stale resume that skipped it,
+        // a deleted file, or cross-session residue each fail closed).
+        private const string ProbeSessionKey =
+            "OpWeave.PackageRemove.state-session";
+
+        private static string ArmProbeNonce()
+        {
+            var nonce = Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeSessionKey, nonce);
+            return nonce;
+        }
+
+        private static void AssertLiveSession(string what)
+        {
+            var expected = SessionState.GetString(ProbeSessionKey, "");
+            if (!File.Exists(StatePath))
+            {
+                Assert.Fail(
+                    expected.Length == 0
+                        ? what + " never persisted in this Editor session (" +
+                            StatePath + " is absent)"
+                        : what + " " + StatePath +
+                            " was deleted after it was written");
+                return;
+            }
+            var session =
+                (string?)JObject.Parse(File.ReadAllText(StatePath))["session"];
+            if (expected.Length == 0 || session != expected)
+            {
+                Assert.Fail(
+                    what + " is stale — a previous Editor session or an " +
+                    "abandoned leg wrote " + StatePath +
+                    "; refusing to trust it");
+            }
+        }
+
         // The quiet-settle window from PackageResolvedReloadTests: the
         // install/removal's compile may finish inside the synchronous
         // resolve while the runner holds the reload lock, so the flags go
@@ -318,6 +455,30 @@ namespace OpWeave.UnityAdapter.Tests
 
         // ---------- setUp / tearDown ----------
 
+        // The pending-reload proof every wait below arms on is only as
+        // strong as the probe it polls: if this Unity version does not
+        // carry it, the fixture fails here — before any install —
+        // instead of silently degrading to an isCompiling-only check
+        // that re-opens the missed-request race the probe exists to
+        // close.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "Unity " + Application.unityVersion + ": " +
+                    ScriptReloadProbeType + "." + ScriptReloadProbeMethod +
+                    " in the UnityEditor assembly must be a static, " +
+                    "parameterless method returning bool");
+            }
+        }
+
         // Installing/removing a package makes the Editor emit a benign
         // [Error] log ("Asset Packages/<name>/package.json has no meta
         // file, but it's in an immutable folder") — the expected
@@ -339,7 +500,25 @@ namespace OpWeave.UnityAdapter.Tests
             if (!ProjectMatchesOriginal())
             {
                 AssetDatabase.Refresh();
+                yield return WaitForReloadPending();
+                Assert.That(ReloadPending(), Is.True,
+                    ReloadTimeoutMessage("the manifest/lock restore"));
                 yield return new WaitForDomainReload();
+            }
+            // A reload the restore left queued still fires on the next
+            // reload-lock release — drain it from this method's own
+            // enumerator (a nested enumerator may not yield
+            // WaitForDomainReload) so the test body starts on a settled
+            // domain and the reload it crosses is provably the
+            // install's own compile.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
             }
             Assert.That(ProjectMatchesOriginal(), Is.True,
                 "the project did not settle on its captured manifest/lock state");
@@ -369,19 +548,59 @@ namespace OpWeave.UnityAdapter.Tests
         public IEnumerator UnityTearDown()
         {
             LogAssert.ignoreFailingMessages = true;
-            RestoreOriginalSync();
-
             var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            string? restoreFailure = null;
+            try
+            {
+                RestoreOriginalSync();
+            }
+            catch (Exception e)
+            {
+                restoreFailure = e.ToString();
+            }
+
             while (!ProjectMatchesOriginal() &&
                    EditorApplication.timeSinceStartup < deadline)
             {
                 yield return null;
             }
+            string? pendingFailure = null;
             if (!ProjectMatchesOriginal())
             {
                 AssetDatabase.Refresh();
-                yield return new WaitForDomainReload();
+                yield return WaitForReloadPending();
+                if (ReloadPending())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                else
+                {
+                    pendingFailure = ReloadTimeoutMessage(
+                        "the manifest/lock restore");
+                }
             }
+            // A reload the install or the restore left queued still
+            // fires on the next reload-lock release — cross each one
+            // here so the next test's setup meets a settled domain. The
+            // WaitForDomainReload sits in this method's own enumerator:
+            // the Unity Test Framework rejects it from a nested
+            // enumerator. The loop also runs on the failure paths above
+            // — a settle or restore failure is recorded and re-reported
+            // only after the queue is drained, so a failure cannot
+            // leave the probe assembly loaded for the next test
+            // without a clear failure of its own.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
+            }
+            Assert.That(restoreFailure, Is.Null,
+                "manifest/lock restore threw: " + restoreFailure);
+            Assert.That(pendingFailure, Is.Null, pendingFailure!);
             Assert.That(ProjectMatchesOriginal(), Is.True,
                 "the project was not restored to its captured " +
                 "manifest/lock state after the package-remove fixture");
@@ -477,7 +696,12 @@ namespace OpWeave.UnityAdapter.Tests
                 "the probe package never registered with UPM after the manifest install");
             AssetDatabase.Refresh();
             yield return WaitForIdleQuiet();
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the probe install"));
+            ArmBoundary("install");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
 
             // Phase B (post-install-reload, pre-remove): every result of
             // the real Operation's work lives inside the helper — the
@@ -498,7 +722,12 @@ namespace OpWeave.UnityAdapter.Tests
                 "the probe package never left the registered list after Client.Remove");
             AssetDatabase.Refresh();
             yield return WaitForIdleQuiet();
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the probe removal"));
+            ArmBoundary("remove");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("remove");
 
             // Phase C (post-remove-reload): the operation is a fresh
             // instance inside each helper and the token reloads from its
@@ -670,6 +899,7 @@ namespace OpWeave.UnityAdapter.Tests
                     return ProbePhaseResult.Fail(
                         "the persisted evidence state is missing after the reload");
                 }
+                AssertLiveSession("the persisted evidence state");
                 if (DomainReloadCounter.Current <= baseline)
                 {
                     return ProbePhaseResult.Fail(
@@ -759,6 +989,7 @@ namespace OpWeave.UnityAdapter.Tests
                     return ProbePhaseResult.Fail(
                         "the persisted evidence state is missing after the reload");
                 }
+                AssertLiveSession("the persisted evidence state");
                 var verdict = new UnityPackageRemoveOperation()
                     .Reconcile(Context(), snapshot);
                 return verdict is ReconcileResult.Completed

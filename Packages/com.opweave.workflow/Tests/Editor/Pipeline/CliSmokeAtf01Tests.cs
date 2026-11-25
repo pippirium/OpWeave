@@ -752,6 +752,38 @@ namespace OpWeave.Pipeline.Tests
             SampleEditorAssembly + " loaded: " +
             AssemblyLoaded(SampleEditorAssembly) + ")";
 
+        // The per-Editor-session resume-owner record behind each body
+        // boundary: armed only by this test's own pre-boundary statement
+        // and SessionState-mirrored across the reload, so a continuation
+        // UTF resumes on a stale enumerator position — one that never
+        // ran the arming segment — finds the previous test's mark or
+        // none and fails the boundary check closed instead of silently
+        // continuing into the post-reload phase. It complements the
+        // s_domainAlive sentinel: the sentinel proves a reload
+        // happened, the owner mark proves this test armed it.
+        private const string BoundaryOwnerSessionKey =
+            "OpWeave.CliSmokeAtf01.boundary-owner";
+
+        private static string CurrentTestFullName =>
+            TestContext.CurrentContext.Test.FullName ??
+            TestContext.CurrentContext.Test.Name ?? "unknown";
+
+        private static void ArmBoundary(string boundaryId) =>
+            SessionState.SetString(
+                BoundaryOwnerSessionKey,
+                CurrentTestFullName + "|" + boundaryId);
+
+        private static void AssertBoundaryOwned(string boundaryId)
+        {
+            var owner = SessionState.GetString(BoundaryOwnerSessionKey, "");
+            Assert.That(
+                owner,
+                Is.EqualTo(CurrentTestFullName + "|" + boundaryId),
+                "the \"" + boundaryId + "\" reload boundary was not armed by " +
+                "this test in this Editor session (armed: \"" + owner +
+                "\") — the continuation resumed on a stale position");
+        }
+
         // ---------- pipeline server / Agent service readiness ----------
 
         // The loopback descriptor the CLI itself reads to find this
@@ -1433,8 +1465,10 @@ namespace OpWeave.Pipeline.Tests
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True,
                 ReloadTimeoutMessage("the sample install"));
+            ArmBoundary("install");
             s_domainAlive = true;
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
             Assert.That(s_domainAlive, Is.False,
                 "the sample install did not cross a domain reload");
 
@@ -1638,8 +1672,10 @@ namespace OpWeave.Pipeline.Tests
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True,
                 ReloadTimeoutMessage("the sample removal"));
+            ArmBoundary("remove");
             s_domainAlive = true;
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("remove");
             Assert.That(s_domainAlive, Is.False,
                 "the sample removal did not cross a domain reload");
 

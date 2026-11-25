@@ -4,7 +4,6 @@
     "references": [
         "OpWeave.AgentApi",
         "OpWeave.Core",
-        "OpWeave.GraphToolkit",
         "OpWeave.Operations",
         "OpWeave.UnityAdapter",
         "OpWeave.Testing",

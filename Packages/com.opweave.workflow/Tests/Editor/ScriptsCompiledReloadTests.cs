@@ -60,6 +60,21 @@ namespace OpWeave.UnityAdapter.Tests
 
         private static string StatePath => Path.Combine(ProbeDir, "compile-state.txt");
         private static string L05Path => Path.Combine(ProbeDir, "l05.txt");
+        private static string SessionProbePath => Path.Combine(ProbeDir, "session.txt");
+
+        // T-W2.4-09: a per-Editor-session token each phase-1 stores in
+        // SessionState and writes into the session probe file beside the
+        // persisted wait state (a JSON document whose reader ignores
+        // unknown members); the post-yield phases read both to prove the
+        // persisted state belongs to this session's phase-1 rather than
+        // residue of an earlier run (the ChangeSetDomainReloadTests
+        // pattern).
+        private const string ProbeTokenKey = "OpWeave.W2409.ScriptsCompiled.ProbeToken";
+
+        // Bound on phase-1 re-drive legs after a predecessor's stale resume
+        // is detected. leg is a method local, so a real reload resets it;
+        // the this-session probe check is what actually ends the loop.
+        private const int MaxReDriveLegs = 3;
 
         private static string ProbeDisk =>
             Path.Combine(ProjectRoot, ProbeFolder.Replace('/', Path.DirectorySeparatorChar));
@@ -107,29 +122,50 @@ namespace OpWeave.UnityAdapter.Tests
             CompileErrorCapture.Clear();
         }
 
+        // Setup and teardown must never yield an ExpectDomainReload
+        // instruction (RecompileScripts): UTF's PrepareForDomainReload
+        // records the CURRENT TestEnumerator's program counter — still a
+        // different test's method enumerator during setup and teardown —
+        // and the resume then applies that stale PC to the next test
+        // method's fresh enumerator, jumping it past phase-1 entirely when
+        // the captured enumerator was abandoned mid-state. The probe-script
+        // deletions queue their compile under the runner's
+        // LockReloadAssemblies, so the reload they need drains at the next
+        // test body's own `yield return new RecompileScripts()`, whose
+        // captured PC is the correct one.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            var markerWasPresent = AssetDatabase.IsValidFolder(ProbeFolder) ||
-                Directory.Exists(ProbeDisk);
+            Crumb("setup cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
             CleanupProbeArtifacts();
-            if (markerWasPresent)
-            {
-                yield return new RecompileScripts(false);
-            }
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
             LogAssert.ignoreFailingMessages = false;
-            var markerWasPresent = AssetDatabase.IsValidFolder(ProbeFolder) ||
-                Directory.Exists(ProbeDisk);
+            Crumb("teardown cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
             CleanupProbeArtifacts();
-            if (markerWasPresent)
+            yield break;
+        }
+
+        // The phase-1 probe proves phase-1 ran in THIS Editor session: the
+        // wait-state file must exist AND the session file's content must
+        // equal the token phase-1 stored in SessionState. Both Library/ and
+        // SessionState survive the reload, so a stale-resume hijack
+        // (phase-1 skipped: no file, no token) and residue of an earlier
+        // session (file yes, token no) both fail the check — the caller
+        // then re-drives a real phase-1 instead of skipping into phase-2.
+        private static bool ProbeWrittenThisSession()
+        {
+            if (!File.Exists(StatePath) || !File.Exists(SessionProbePath))
             {
-                yield return new RecompileScripts(false);
+                return false;
             }
+            var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+            return expectedToken.Length > 0 &&
+                File.ReadAllText(SessionProbePath).Trim() == expectedToken;
         }
 
         // The reload-during-Waiting case of
@@ -146,14 +182,40 @@ namespace OpWeave.UnityAdapter.Tests
             Assert.That(phase1.Ok, Is.True,
                 "pre-reload phase failed: " + phase1.Failure);
 
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC applies to this fresh enumerator and lands it at one
+            // of the post-yield states inside this loop (or in the poll loop
+            // below) — with every local reset to default. Each continuation
+            // drains, then MUST pass the this-session probe check: a probe
+            // phase-1 never wrote re-drives a real phase-1 + marker + reload
+            // instead of skipping silently into phase-2. If the probe still
+            // cannot be produced after the bound, the loop exits and
+            // phase-2's existing never-executed diagnostic fails loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var legGuard = 0;
+                while (DomainSentinelAlive && legGuard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the probe compile did not produce a domain reload");
+
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // Deleting the probe folder guarantees the marker re-write
+                // queues a real compile rather than a byte-identical no-op.
+                CleanupProbeArtifacts();
+                var redrive = RunPhaseBeforeReload();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " ok=" + redrive.Ok +
+                    " failure=" + redrive.Failure);
+                Assert.That(redrive.Ok, Is.True,
+                    "re-driven pre-reload phase failed: " + redrive.Failure);
             }
-            Assert.IsFalse(DomainSentinelAlive,
-                "the probe compile did not produce a domain reload");
 
             var phase2 = RunPhaseAfterReload();
             Crumb("phase-2 returned ok=" + phase2.Ok + " failure=" + phase2.Failure);
@@ -163,7 +225,7 @@ namespace OpWeave.UnityAdapter.Tests
             // The Editor may still be settling right after the reload — a
             // Pending verdict is lawful until it is idle, so keep polling
             // the persisted token across frames.
-            guard = 0;
+            var guard = 0;
             while (guard++ < 600)
             {
                 var check = CheckPersistedToken();
@@ -195,15 +257,44 @@ namespace OpWeave.UnityAdapter.Tests
             Assert.That(phase1.Ok, Is.True,
                 "pre-compile phase failed: " + phase1.Failure);
 
-            yield return new RecompileScripts(true, false);
-            LogAssert.ignoreFailingMessages = false;
-            var guard = 0;
-            while (EditorApplication.isCompiling && guard++ < 600)
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC can land this fresh enumerator at one of the
+            // post-yield states inside this loop — skipping the broken
+            // script write entirely. Each continuation drains, then MUST
+            // pass the this-session probe check or re-drive a real phase-1;
+            // after the bound, the poll loop's OW-RUN-009 expectations fail
+            // loudly on the missing state.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
-            }
+                yield return new RecompileScripts(true, false);
+                LogAssert.ignoreFailingMessages = false;
+                var legGuard = 0;
+                while (EditorApplication.isCompiling && legGuard++ < 600)
+                {
+                    yield return null;
+                }
 
-            guard = 0;
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // Deleting the probe folder guarantees the broken-script
+                // re-write queues a real compile rather than a
+                // byte-identical no-op.
+                CleanupProbeArtifacts();
+                LogAssert.ignoreFailingMessages = true;
+                var redrive = RunPhaseBeforeBrokenCompile();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " ok=" + redrive.Ok +
+                    " failure=" + redrive.Failure);
+                Assert.That(redrive.Ok, Is.True,
+                    "re-driven pre-compile phase failed: " + redrive.Failure);
+            }
+            Assert.That(ProbeWrittenThisSession(),
+                "the persisted wait probe is missing or stale — phase-1 did " +
+                "not execute in this Editor session");
+
+            var guard = 0;
             while (guard++ < 600)
             {
                 var check = CheckPersistedToken();
@@ -239,21 +330,43 @@ namespace OpWeave.UnityAdapter.Tests
             Assert.That(phase1.Ok, Is.True,
                 "pre-request phase failed: " + phase1.Failure);
 
-            yield return new RecompileScripts(false, false);
-            // Give a queued reload its chance, but a no-change request may
-            // leave the domain standing — the bound is a grace, not an
-            // expectation (L-05).
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 600)
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC can land this fresh enumerator past the yield —
+            // skipping ArmWaitForNoChange so RecordL05 would read residue or
+            // nothing. Each continuation drains (the bound stays a grace,
+            // never an expectation — L-05), then MUST pass the this-session
+            // probe check or re-drive a real arm+request; after the bound
+            // RecordL05's missing-state diagnostic fails loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts(false, false);
+                // Give a queued reload its chance, but a no-change request
+                // may leave the domain standing — the bound is a grace, not
+                // an expectation (L-05).
+                var legGuard = 0;
+                while (DomainSentinelAlive && legGuard++ < 600)
+                {
+                    yield return null;
+                }
+
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                CleanupProbeArtifacts();
+                var redrive = ArmWaitForNoChange();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " ok=" + redrive.Ok +
+                    " failure=" + redrive.Failure);
+                Assert.That(redrive.Ok, Is.True,
+                    "re-driven pre-request phase failed: " + redrive.Failure);
             }
 
             var record = RecordL05();
             Assert.That(record.Ok, Is.True,
                 "the L-05 recording failed: " + record.Failure);
 
-            guard = 0;
+            var guard = 0;
             while (guard++ < 600)
             {
                 var check = CheckPersistedToken();
@@ -357,6 +470,24 @@ namespace OpWeave.UnityAdapter.Tests
             try
             {
                 Crumb("phase-2 begin: reading persisted resumeToken");
+                var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+                if (!File.Exists(StatePath))
+                {
+                    return ProbePhaseResult.Fail(
+                        expectedToken.Length == 0
+                            ? "phase-1 never executed in this Editor session (" +
+                                StatePath + " was never written; probeDir exists=" +
+                                Directory.Exists(ProbeDir) + ")"
+                            : "the persisted wait state " + StatePath +
+                                " was deleted after phase-1 wrote it");
+                }
+                if (expectedToken.Length == 0 || !File.Exists(SessionProbePath) ||
+                    File.ReadAllText(SessionProbePath).Trim() != expectedToken)
+                {
+                    return ProbePhaseResult.Fail(
+                        "the persisted wait state is stale — a previous Editor " +
+                        "session wrote " + SessionProbePath);
+                }
                 if (!TryReadWait(out var token, out var baseline))
                 {
                     return ProbePhaseResult.Fail("the persisted wait state is missing");
@@ -431,6 +562,15 @@ namespace OpWeave.UnityAdapter.Tests
         private static PersistedCheck CheckPersistedToken()
         {
             var check = new PersistedCheck();
+            if (!ProbeWrittenThisSession())
+            {
+                // A resumed wait must never consume a previous Editor
+                // session's persisted token: missing and stale probe state
+                // are both hard failures, never a silent success.
+                check.Kind = WaitStatusKind.Failed;
+                check.Code = File.Exists(StatePath) ? "stale-state" : "missing-state";
+                return check;
+            }
             if (!TryReadWait(out var token, out _, out _))
             {
                 check.Kind = WaitStatusKind.Failed;
@@ -461,6 +601,9 @@ namespace OpWeave.UnityAdapter.Tests
             };
             Directory.CreateDirectory(ProbeDir);
             File.WriteAllText(StatePath, state.ToString());
+            var sessionToken = Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeTokenKey, sessionToken);
+            File.WriteAllText(SessionProbePath, sessionToken + "\n");
             Crumb("persisted wait state: " +
                 state.ToString(Newtonsoft.Json.Formatting.None));
         }

@@ -711,6 +711,236 @@ namespace OpWeave.UnityAdapter.Tests
             }
         }
 
+        // ── SPEC §E2 item 3 (a): a terminal event is not the release ──
+
+        /// <summary>T-W4.6-09 regression: a terminal §E8 event proves the
+        /// journal ended, not that the exclusion was released. A Queued and
+        /// an AwaitingApproval Run that never held the exclusion end while
+        /// the owned Run still holds it — their terminal events must not
+        /// spend the owned Run's hand-off record, or a reload could no
+        /// longer name or adopt the still-live OS handle.</summary>
+        [Test]
+        public void InactiveRunTerminalEventsKeepTheOwnedRunHandoffRecord()
+        {
+            var fixture = new RunnerHostFixture(StoreRoot);
+            try
+            {
+                var waitable = new RunnerHostFixture.ControlledWaitableOperation(HoldOp);
+                fixture.Register(waitable, 'b');
+                RegisterOperations(fixture);
+                fixture.Install();
+                var holdId = Accept(fixture, HoldPlan(), Doc("h", HoldOp), queue: false);
+                Tick(fixture);
+                Assert.AreEqual(RunState.Running, fixture.Host.Coordinator.StateOf(holdId));
+                Assert.AreEqual(
+                    holdId, RunLockHandoff.OwnedRunId(StoreRoot),
+                    "the Running Run is recorded as this Editor's exclusion owner");
+
+                var queuedId = Accept(fixture, MarkPlan(), Doc("m", MarkerOp), queue: true);
+                var askId = Accept(fixture, AskPlan(), Doc("ask", MarkerOp), queue: true);
+
+                var cancelQueued = fixture.Host.Coordinator.Cancel(queuedId, "no longer needed");
+                Assert.IsTrue(
+                    cancelQueued.Ok,
+                    "the Queued Run refused the cancel request: " +
+                    Describe(cancelQueued.Diagnostics));
+                // Each terminal event triggers the §F8 retention pass, which
+                // cannot take the exclusion while the owned Run still holds
+                // it — the refused pass reports OW-RUN-002, the expected
+                // transient outcome for a live owner.
+                UnityEngine.TestTools.LogAssert.Expect(
+                    UnityEngine.LogType.Error,
+                    new System.Text.RegularExpressions.Regex(
+                        "OpWeave: the Run retention pass failed: OW-RUN-002"));
+                Tick(fixture);
+                Assert.AreEqual(
+                    RunState.Cancelled, fixture.Host.Coordinator.StateOf(queuedId));
+                Assert.AreEqual(
+                    holdId, RunLockHandoff.OwnedRunId(StoreRoot),
+                    "a terminal event for a Run that never held the exclusion spent " +
+                    "the owned Run's hand-off while the exclusion was still held");
+
+                var cancelAsk = fixture.Host.Coordinator.Cancel(askId, "no longer needed");
+                Assert.IsTrue(
+                    cancelAsk.Ok,
+                    "the AwaitingApproval Run refused the cancel request: " +
+                    Describe(cancelAsk.Diagnostics));
+                UnityEngine.TestTools.LogAssert.Expect(
+                    UnityEngine.LogType.Error,
+                    new System.Text.RegularExpressions.Regex(
+                        "OpWeave: the Run retention pass failed: OW-RUN-002"));
+                Tick(fixture);
+                Assert.AreEqual(
+                    RunState.Cancelled, fixture.Host.Coordinator.StateOf(askId));
+                Assert.AreEqual(
+                    holdId, RunLockHandoff.OwnedRunId(StoreRoot),
+                    "a terminal event for an approval-pending Run that never held " +
+                    "the exclusion spent the owned Run's hand-off");
+
+                waitable.Release = true;
+                RunUntilTerminal(fixture, holdId);
+                Assert.IsNull(
+                    RunLockHandoff.OwnedRunId(StoreRoot),
+                    "the owned Run's own terminal event, after its release, drops the record");
+            }
+            finally
+            {
+                fixture.Dispose();
+            }
+        }
+
+        /// <summary>T-W4.6-09 regression: the SPEC §F1 store-failure end
+        /// publishes the terminal event while the Run's exclusion is still
+        /// held — its release is deferred to the next
+        /// <c>ReleaseEndedRunLocks</c>, which publishes nothing. The
+        /// hand-off record must survive that event: clearing it strands a
+        /// live OS handle with no SessionState record the next domain could
+        /// adopt. The record is spent only once the recovery pass proves
+        /// nothing is held.</summary>
+        [Test]
+        public void OwnedRunTerminalEventBeforeItsReleaseKeepsTheHandoffRecord()
+        {
+            var fixture = new RunnerHostFixture(StoreRoot);
+            try
+            {
+                var waitable = new RunnerHostFixture.ControlledWaitableOperation(HoldOp);
+                fixture.Register(waitable, 'b');
+                fixture.Install();
+                var holdId = Accept(fixture, HoldPlan(), Doc("h", HoldOp), queue: false);
+                Tick(fixture);
+                Assert.AreEqual(RunState.Running, fixture.Host.Coordinator.StateOf(holdId));
+                Assert.AreEqual(holdId, RunLockHandoff.OwnedRunId(StoreRoot));
+
+                // Observed at the terminal dispatch itself, not after the
+                // Tick that also runs the deferred release: the ordering the
+                // fix keys on.
+                var terminalEventSeen = false;
+                var heldAtTerminalEvent = false;
+                fixture.Host.Events.RunStateChanged += change =>
+                {
+                    if (change.RunId == holdId &&
+                        change.State is RunState.Succeeded or RunState.Failed
+                            or RunState.Cancelled)
+                    {
+                        terminalEventSeen = true;
+                        heldAtTerminalEvent = fixture.Host.Coordinator.HoldsAnyRunLock();
+                    }
+                };
+
+                // A refused required cancel_requested marks the Running Run
+                // for the store-failure end without an event; the next Tick
+                // journals run_finished{failed} and publishes the terminal
+                // event while the Run still holds the exclusion.
+                var failOnce = true;
+                fixture.Host.Store.JournalStreamWrapper = stream =>
+                {
+                    if (!failOnce)
+                    {
+                        return stream;
+                    }
+                    failOnce = false;
+                    throw new IOException("injected journal refusal");
+                };
+                var cancelled = fixture.Host.Coordinator.Cancel(holdId, "stop requested");
+                fixture.Host.Store.JournalStreamWrapper = null;
+                Assert.IsFalse(cancelled.Ok, "the refused cancel request must fail");
+                Assert.IsTrue(
+                    fixture.Host.Coordinator.HoldsRunLock(holdId),
+                    "the marked Run keeps its still-held exclusion for the deferred release");
+
+                // The Tick publishes the store-failure end's terminal event
+                // before the deferred release lands, so its §F8 retention
+                // pass runs while the exclusion is still held — the refused
+                // pass reports OW-RUN-002, the expected transient outcome.
+                UnityEngine.TestTools.LogAssert.Expect(
+                    UnityEngine.LogType.Error,
+                    new System.Text.RegularExpressions.Regex(
+                        "OpWeave: the Run retention pass failed: OW-RUN-002"));
+                Tick(fixture);
+                Assert.AreEqual(RunState.Failed, fixture.Host.Coordinator.StateOf(holdId));
+                Assert.IsTrue(
+                    terminalEventSeen,
+                    "the store-failure end must publish the terminal event");
+                Assert.IsTrue(
+                    heldAtTerminalEvent,
+                    "the store-failure end publishes its terminal event before " +
+                    "the deferred release — the ordering this guard exists for");
+                Assert.AreEqual(
+                    holdId, RunLockHandoff.OwnedRunId(StoreRoot),
+                    "a terminal event published before the release must not spend " +
+                    "the owned Run's hand-off record");
+
+                // The same Tick's deferred release has now dropped the
+                // exclusion; the retained record is residue the recovery
+                // pass spends through its own hold check.
+                Assert.IsFalse(
+                    fixture.Host.Coordinator.HoldsAnyRunLock(),
+                    "the deferred release retried by the Tick must have dropped the exclusion");
+                Assert.IsTrue(
+                    ExclusionReleased(),
+                    "the exclusion is free once the deferred release landed");
+                var report = Recover(fixture);
+                Assert.IsTrue(report.ExclusionHeld);
+                Assert.IsNull(
+                    RunLockHandoff.OwnedRunId(StoreRoot),
+                    "the recovery pass spends the residue once nothing is held");
+            }
+            finally
+            {
+                fixture.Dispose();
+            }
+        }
+
+        /// <summary>T-W4.6-09 regression: the owned Run's own terminal event
+        /// still drops the record once the release it followed is proven —
+        /// <c>EndRun</c> empties lock.json and closes the handle BEFORE the
+        /// §E8 dispatch, so nothing is held when the orderly end's event
+        /// arrives.</summary>
+        [Test]
+        public void OwnedRunTerminalEventClearsTheHandoffOnceTheReleaseIsProven()
+        {
+            var fixture = new RunnerHostFixture(StoreRoot);
+            try
+            {
+                var waitable = new RunnerHostFixture.ControlledWaitableOperation(HoldOp);
+                fixture.Register(waitable, 'b');
+                fixture.Install();
+                var holdId = Accept(fixture, HoldPlan(), Doc("h", HoldOp), queue: false);
+                Tick(fixture);
+                Assert.AreEqual(RunState.Running, fixture.Host.Coordinator.StateOf(holdId));
+                Assert.AreEqual(holdId, RunLockHandoff.OwnedRunId(StoreRoot));
+
+                var terminalEventSeen = false;
+                var heldAtTerminalEvent = true;
+                fixture.Host.Events.RunStateChanged += change =>
+                {
+                    if (change.RunId == holdId &&
+                        change.State is RunState.Succeeded or RunState.Failed
+                            or RunState.Cancelled)
+                    {
+                        terminalEventSeen = true;
+                        heldAtTerminalEvent = fixture.Host.Coordinator.HoldsAnyRunLock();
+                    }
+                };
+
+                waitable.Release = true;
+                RunUntilTerminal(fixture, holdId);
+                Assert.IsTrue(
+                    terminalEventSeen,
+                    "the orderly end must publish its terminal event");
+                Assert.IsFalse(
+                    heldAtTerminalEvent,
+                    "the orderly end releases the exclusion before the terminal event");
+                Assert.IsNull(
+                    RunLockHandoff.OwnedRunId(StoreRoot),
+                    "the record is spent once the journal is terminal and nothing is held");
+            }
+            finally
+            {
+                fixture.Dispose();
+            }
+        }
+
         // ── SPEC §E2 item 3: the hand-off records belong to their own root ──
 
         /// <summary>W4.3-R02: both §E2 item 3 hand-off records belong to the Run

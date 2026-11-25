@@ -80,7 +80,7 @@ namespace OpWeave.Operations
                     Array.Empty<PlannedChange>(),
                     JsonValue.From(new JObject()));
             }
-            if (ctx.IsPresent(SpacePort) &&
+            if (ctx.IsPresent(SpacePort) && !ctx.IsPending(SpacePort) &&
                 !IsKnownSpace(ctx.Get<string>(SpacePort)))
             {
                 return new PreflightResult(
@@ -88,16 +88,22 @@ namespace OpWeave.Operations
                     Array.Empty<PlannedChange>(),
                     JsonValue.From(new JObject()));
             }
-            try
+            // An edge-fed target has no value until its producer runs.
+            // Dry-run Preflight may validate concrete Refs but cannot read
+            // a pending placeholder (SPEC §D8).
+            if (!ctx.IsPending(TargetPort))
             {
-                ctx.Get<GameObject>(TargetPort);
-            }
-            catch (StepContextException failure)
-            {
-                return new PreflightResult(
-                    failure.Diagnostics,
-                    Array.Empty<PlannedChange>(),
-                    JsonValue.From(new JObject()));
+                try
+                {
+                    ctx.Get<GameObject>(TargetPort);
+                }
+                catch (StepContextException failure)
+                {
+                    return new PreflightResult(
+                        failure.Diagnostics,
+                        Array.Empty<PlannedChange>(),
+                        JsonValue.From(new JObject()));
+                }
             }
             return base.Preflight(ctx);
         }

@@ -540,8 +540,12 @@ namespace OpWeave.Operations
             return true;
         }
 
+        // A pending edge-fed setup has no value to inspect on the Dry-Run
+        // path (SPEC §D8 item 1): it takes the declared default like a
+        // missing port.
         private static string Setup(StepContext ctx) =>
-            ctx.IsPresent(SceneOps.SetupPort)
+            ctx.IsPresent(SceneOps.SetupPort) &&
+                !ctx.IsPending(SceneOps.SetupPort)
                 ? ctx.Get<string>(SceneOps.SetupPort)
                 : SceneOps.SetupDefault;
 
@@ -580,7 +584,8 @@ namespace OpWeave.Operations
                     "Choose a scene path that does not exist yet.");
             }
             single = string.Equals(
-                ctx.IsPresent(SceneOps.ModePort)
+                ctx.IsPresent(SceneOps.ModePort) &&
+                    !ctx.IsPending(SceneOps.ModePort)
                     ? ctx.Get<string>(SceneOps.ModePort)
                     : SceneOps.ModeAdditive,
                 SceneOps.ModeSingle, StringComparison.Ordinal);

@@ -413,6 +413,103 @@ namespace OpWeave.UnityAdapter.Tests
             !PackageInstalled(TagPackage) && !PackageInstalled(ShaPackage) &&
             !AssemblyLoaded(TagAssemblyName) && !AssemblyLoaded(ShaAssemblyName);
 
+        // ---------- pending-reload proof + per-session identity ----------
+
+        // The same pending-request flag WaitForDomainReload.Perform
+        // polls — Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the wait
+        // reaches it through reflection. A reload already armed behind
+        // the runner's reload lock surfaces here while isCompiling is
+        // false, which is exactly the deferred state the quiet window
+        // missed. The probe is resolved deterministically from the
+        // UnityEditor assembly and its shape is proven once at fixture
+        // start: a Unity version without it fails the fixture outright —
+        // there is no isCompiling-only fallback.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly System.Reflection.MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    System.Reflection.BindingFlags.Static |
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
+
+        // The pending proof WaitForDomainReload needs before it is
+        // yielded: its Perform throws the moment neither flag is set, so
+        // the instruction may only be armed once a reload is provably
+        // queued — a requested script reload, or an in-flight compile
+        // that ends in one. The wait only waits — it never throws and
+        // never yields an edit-mode yield instruction, which a nested
+        // enumerator is not allowed to yield; the caller checks
+        // ReloadPending() afterwards so teardown can record a timeout
+        // and still drain the reloads the failure left queued.
+        private static IEnumerator WaitForReloadPending()
+        {
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            while (!ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+        }
+
+        private static string ReloadTimeoutMessage(string what) =>
+            "no domain reload became pending within " + WaitTimeoutSec +
+            " s of " + what;
+
+        // The per-Editor-session resume-owner record behind each body
+        // boundary: armed only by this test's own pre-boundary statement
+        // and SessionState-mirrored across the reload, so a continuation
+        // UTF resumes on a stale enumerator position — one that never
+        // ran the arming segment — finds the previous test's mark or
+        // none and fails the boundary check closed instead of silently
+        // continuing into the post-reload phase.
+        private const string BoundaryOwnerSessionKey =
+            "OpWeave.UpmProvenance.boundary-owner";
+
+        private static string CurrentTestFullName =>
+            TestContext.CurrentContext.Test.FullName ??
+            TestContext.CurrentContext.Test.Name ?? "unknown";
+
+        private static void ArmBoundary(string boundaryId) =>
+            SessionState.SetString(
+                BoundaryOwnerSessionKey,
+                CurrentTestFullName + "|" + boundaryId);
+
+        private static void AssertBoundaryOwned(string boundaryId)
+        {
+            var owner = SessionState.GetString(BoundaryOwnerSessionKey, "");
+            Assert.That(
+                owner,
+                Is.EqualTo(CurrentTestFullName + "|" + boundaryId),
+                "the \"" + boundaryId + "\" reload boundary was not armed by " +
+                "this test in this Editor session (armed: \"" + owner +
+                "\") — the continuation resumed on a stale position");
+        }
+
         // ---------- provenance assertions ----------
 
         private static void AssertProvenanceNeverSelfDeclared(UpmPackageProvenance provenance)
@@ -584,6 +681,30 @@ namespace OpWeave.UnityAdapter.Tests
 
         // ---------- setUp / tearDown ----------
 
+        // The pending-reload proof every wait below arms on is only as
+        // strong as the probe it polls: if this Unity version does not
+        // carry it, the fixture fails here — before any install —
+        // instead of silently degrading to an isCompiling-only check
+        // that re-opens the missed-request race the probe exists to
+        // close.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "Unity " + Application.unityVersion + ": " +
+                    ScriptReloadProbeType + "." + ScriptReloadProbeMethod +
+                    " in the UnityEditor assembly must be a static, " +
+                    "parameterless method returning bool");
+            }
+        }
+
         // Installing/removing a package makes the Editor emit a benign
         // [Error] log ("Asset Packages/<name>/package.json has no meta
         // file, but it's in an immutable folder") — the same expected
@@ -627,7 +748,25 @@ namespace OpWeave.UnityAdapter.Tests
             if (!FixtureBaselineAbsent())
             {
                 AssetDatabase.Refresh();
+                yield return WaitForReloadPending();
+                Assert.That(ReloadPending(), Is.True,
+                    ReloadTimeoutMessage("the fixture cleanup"));
                 yield return new WaitForDomainReload();
+            }
+            // A reload the cleanup left queued still fires on the next
+            // reload-lock release — drain it from this method's own
+            // enumerator (a nested enumerator may not yield
+            // WaitForDomainReload) so the test body starts on a settled
+            // domain and the reload it crosses is provably the
+            // install's own compile.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
             }
             Assert.That(FixtureBaselineAbsent(), Is.True, "fixture packages still installed");
         }
@@ -660,11 +799,40 @@ namespace OpWeave.UnityAdapter.Tests
                 }
                 yield return null;
             }
+            string? pendingFailure = null;
             if (!FixtureBaselineAbsent())
             {
                 AssetDatabase.Refresh();
-                yield return new WaitForDomainReload();
+                yield return WaitForReloadPending();
+                if (ReloadPending())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                else
+                {
+                    pendingFailure = ReloadTimeoutMessage("the fixture cleanup");
+                }
             }
+            // A reload the install or the cleanup left queued still
+            // fires on the next reload-lock release — cross each one
+            // here so the next test's setup meets a settled domain. The
+            // WaitForDomainReload sits in this method's own enumerator:
+            // the Unity Test Framework rejects it from a nested
+            // enumerator. The loop also runs on the failure path above —
+            // a pending-reload timeout is recorded and re-reported only
+            // after the queue is drained, so a failure cannot leave a
+            // fixture assembly loaded for the next test without a clear
+            // failure of its own.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
+            }
+            Assert.That(pendingFailure, Is.Null, pendingFailure!);
             Assert.That(FixtureBaselineAbsent(), Is.True,
                 "project not restored to baseline after provenance fixture cleanup");
         }
@@ -821,7 +989,12 @@ namespace OpWeave.UnityAdapter.Tests
             if (!AssemblyLoaded(TagAssemblyName) || !AssemblyLoaded(ShaAssemblyName))
             {
                 AssetDatabase.Refresh();
+                yield return WaitForReloadPending();
+                Assert.That(ReloadPending(), Is.True,
+                    ReloadTimeoutMessage("the fixture install"));
+                ArmBoundary("install");
                 yield return new WaitForDomainReload();
+                AssertBoundaryOwned("install");
             }
 
             // Phase 2 (post-reload): all state re-derived — the fixture
@@ -833,14 +1006,16 @@ namespace OpWeave.UnityAdapter.Tests
             var quietStart = -1.0;
             while (EditorApplication.timeSinceStartup < loadedDeadline)
             {
-                if (EditorApplication.isCompiling)
+                if (ScriptReloadRequested())
                 {
+                    ArmBoundary("install-drain");
                     yield return new WaitForDomainReload();
+                    AssertBoundaryOwned("install-drain");
                     loadedDeadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
                     quietStart = -1.0;
                     continue;
                 }
-                if (EditorApplication.isUpdating)
+                if (EditorApplication.isCompiling || EditorApplication.isUpdating)
                 {
                     quietStart = -1.0;
                     yield return null;
@@ -868,7 +1043,12 @@ namespace OpWeave.UnityAdapter.Tests
             if (!AssemblyLoaded(TagAssemblyName) || !AssemblyLoaded(ShaAssemblyName))
             {
                 AssetDatabase.Refresh();
+                yield return WaitForReloadPending();
+                Assert.That(ReloadPending(), Is.True,
+                    ReloadTimeoutMessage("the fixture install"));
+                ArmBoundary("install");
                 yield return new WaitForDomainReload();
+                AssertBoundaryOwned("install");
             }
             Assert.That(AssemblyLoaded(TagAssemblyName), Is.True,
                 "tag fixture assembly never loaded after the domain reload");

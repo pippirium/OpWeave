@@ -2,11 +2,13 @@
 
 using System.Runtime.CompilerServices;
 
-// The EditMode test assembly drives the dispatcher drain through the internal
+// The EditMode test assemblies drive the dispatcher drain through the internal
 // seam directly (invoking EditorApplication.update inside a test re-enters the
 // Unity Test Framework's own update callback); the public surface stays the
-// SPEC-defined one.
+// SPEC-defined one. The Graph Toolkit tests live in their own 6000.5-gated
+// assembly.
 [assembly: InternalsVisibleTo("OpWeave.UnityAdapter.Tests")]
+[assembly: InternalsVisibleTo("OpWeave.GraphToolkit.Tests")]
 // SPEC §G2's public IRefResolver carries only Resolve<T> where T :
 // UnityEngine.Object; Scene is a struct, so Operations reach the
 // concrete RefResolver.ResolveScene through this internal seam.

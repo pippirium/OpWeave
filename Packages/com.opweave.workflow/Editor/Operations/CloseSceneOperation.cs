@@ -160,7 +160,10 @@ namespace OpWeave.Operations
             }
             if (scene.isDirty)
             {
-                var mode = ctx.IsPresent(SceneOps.DirtyScenesPort)
+                // A pending dirtyScenes is edge-fed (SPEC §D8 item 1): it
+                // takes the "fail" default like a missing port.
+                var mode = ctx.IsPresent(SceneOps.DirtyScenesPort) &&
+                    !ctx.IsPending(SceneOps.DirtyScenesPort)
                     ? ctx.Get<string>(SceneOps.DirtyScenesPort)
                     : SceneOps.DirtyScenesFail;
                 if (!string.Equals(mode, SceneOps.DirtyScenesSave, StringComparison.Ordinal))

@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using OpWeave.Core.Persistence;
 using OpWeave.Core.Runtime;
 using Unity.GraphToolkit.Editor;
+using UnityEditor;
 using UnityEngine;
 
 namespace OpWeave.GraphToolkit
@@ -208,5 +209,42 @@ namespace OpWeave.GraphToolkit
         /// <inheritdoc/>
         public override void OnGraphChanged(GraphLogger graphLogger) =>
             GraphLiveValidation.OnGraphChanged(this, graphLogger);
+    }
+
+    /// <summary>
+    /// The SPEC §H6 item 6 menu entry <c>Assets &gt; Create &gt; OpWeave &gt;
+    /// Graph</c> (including the Project window's right-click Create menu):
+    /// creation of a new <c>*.opweavegraph</c> through the supported public
+    /// <see cref="GraphDatabase.PromptInProjectBrowserToCreateNewAsset{T}"/>
+    /// — Unity's own Project Browser flow in the selected <c>Assets/</c>
+    /// folder, with the standard inline rename prompt and collision
+    /// handling. No hand-written asset bytes, custom importer or
+    /// fallback path: a non-writable selection gets Unity's native
+    /// behaviour only. The new graph starts unlinked — creation, rename
+    /// and the toolkit's own Save never write <c>.opweave.json</c>; the
+    /// explicit Save Graph JSON command of SPEC §H7 item 3 stays the only
+    /// JSON writer. The whole OpWeave.GraphToolkit assembly compiles only
+    /// on Unity 6000.5+ (asmdef <c>defineConstraints</c>), so the entry
+    /// exists exactly where the toolkit does, alongside the unchanged
+    /// <c>Assets &gt; Create &gt; OpWeave &gt; Operation</c> item.
+    /// </summary>
+    internal static class OpWeaveGraphCreateMenu
+    {
+        /// <summary>The Unity menu path of SPEC §H6 item 6.</summary>
+        internal const string MenuPath = "Assets/Create/OpWeave/Graph";
+
+        /// <summary>
+        /// The default-name placeholder the Project Browser rename field
+        /// starts from — a UI hint, not a fixed on-disk name: the human's
+        /// rename and Unity's collision handling pick the final asset
+        /// name.
+        /// </summary>
+        internal const string DefaultAssetName = "New OpWeave Graph";
+
+        /// <summary>The <c>Assets &gt; Create &gt; OpWeave &gt; Graph</c> entry.</summary>
+        [MenuItem(MenuPath)]
+        private static void CreateGraphAsset() =>
+            GraphDatabase.PromptInProjectBrowserToCreateNewAsset<OpWeaveGraph>(
+                DefaultAssetName);
     }
 }

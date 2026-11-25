@@ -101,7 +101,14 @@ namespace OpWeave.UnityAdapter.Tests
                 catch (Exception) { /* leftover handles stay for the next run */ }
             }
             Directory.CreateDirectory(CloneDir);
-            EditorProcessHarness.CloneProject(ProjectRoot, CloneDir);
+            EditorProcessHarness.CloneProject(
+                ProjectRoot, CloneDir, AtF07Matrix.CloneExcludedFolders);
+            // Fail-closed alongside the exclusion: no generated fixture
+            // tree may reach the clone — a child's own arrange writes
+            // them fresh, and an inherited one is an occupied
+            // never-overwrite target (OW-UNITY-005, T-W2.4-11).
+            EditorProcessHarness.ScrubProjectDirectories(
+                CloneDir, AtF07Matrix.CloneExcludedFolders);
         }
 
         [TearDown]
@@ -175,7 +182,8 @@ namespace OpWeave.UnityAdapter.Tests
         private JObject WaitCheckpoint(string jobDir, EditorProcessHarness.EditorChild child)
         {
             var text = EditorProcessHarness.WaitForFileContent(
-                Path.Combine(jobDir, "checkpoint.json"), CheckpointTimeoutMs);
+                Path.Combine(jobDir, "checkpoint.json"), CheckpointTimeoutMs,
+                watchedProcess: child.Process);
             Assert.IsNotNull(
                 text,
                 "the arrange child never wrote checkpoint.json; log: " +
@@ -191,7 +199,8 @@ namespace OpWeave.UnityAdapter.Tests
                 "the verify child did not exit; log: " + child.LogPath +
                 "; output: " + EditorProcessHarness.ChildOutput(child));
             var text = EditorProcessHarness.WaitForFileContent(
-                Path.Combine(jobDir, "verdict.json"), 30000);
+                Path.Combine(jobDir, "verdict.json"), 30000,
+                watchedProcess: child.Process);
             Assert.IsNotNull(
                 text,
                 "the verify child never wrote verdict.json; log: " +
@@ -395,7 +404,8 @@ namespace OpWeave.UnityAdapter.Tests
             // the §E4 write-ahead made durable; nothing is cut or forged.
             Assert.IsNotNull(
                 EditorProcessHarness.WaitForFileContent(
-                    Path.Combine(jobDir, "in-save.signal"), CheckpointTimeoutMs),
+                    Path.Combine(jobDir, "in-save.signal"), CheckpointTimeoutMs,
+                    watchedProcess: arrange.Process),
                 "the arrange child never reached the in-save barrier; log: " +
                 arrange.LogPath + "; fatal: " + Fatal(jobDir) +
                 "; output: " + EditorProcessHarness.ChildOutput(arrange));
