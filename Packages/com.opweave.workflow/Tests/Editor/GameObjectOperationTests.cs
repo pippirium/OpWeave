@@ -86,7 +86,8 @@ namespace OpWeave.UnityAdapter.Tests
             IReadOnlyDictionary<string, InputValue> inputs,
             IReadOnlyDictionary<string, string> inputTypes,
             IReadOnlyDictionary<string, string> outputTypes,
-            IChangeRecorder? changes = null) =>
+            IChangeRecorder? changes = null,
+            IReadOnlyDictionary<string, string>? pending = null) =>
             new UnityStepContext(
                 inputs,
                 inputTypes,
@@ -95,7 +96,8 @@ namespace OpWeave.UnityAdapter.Tests
                 new RefResolver(),
                 changes ?? new StepChangeRecorder(0, "go"),
                 new StepLogSink(
-                    "run", 0, (_, _, _, _) => Result<Unit>.Success(Unit.Value)));
+                    "run", 0, (_, _, _, _) => Result<Unit>.Success(Unit.Value)),
+                pendingProducers: pending);
 
         private static JsonValue GoRef(GameObject go) =>
             new RefResolver().ToRef(go, "unity.GameObjectRef");
@@ -137,6 +139,149 @@ namespace OpWeave.UnityAdapter.Tests
             (result.Error is null
                 ? string.Empty
                 : " " + result.Error.Code + " " + result.Error.Message);
+
+        // #257 / SPEC §D8: pending producers are counted as present,
+        // but Get<T> on them is a programming error. Preflight must
+        // not read those values before the producing step runs.
+        [Test]
+        public void TransformSet_Preflight_PendingTargetDoesNotThrow()
+        {
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["position"] = InputValue.Present(
+                        Json("{\"x\":1,\"y\":2,\"z\":3}")),
+                },
+                TransformIn, NoPorts,
+                pending: new Dictionary<string, string>
+                {
+                    ["target"] = "upstream-target",
+                });
+
+            Assert.That(context.IsPending("target"), Is.True);
+            Assert.That(context.IsPresent("target"), Is.True);
+
+            var result = new TransformSetOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        [Test]
+        public void Find_Preflight_PendingSceneDoesNotThrow()
+        {
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["name"] = InputValue.Present(Json("\"Subject\"")),
+                },
+                FindIn, GoOut,
+                pending: new Dictionary<string, string>
+                {
+                    ["scene"] = "upstream-scene",
+                });
+
+            Assert.That(context.IsPending("scene"), Is.True);
+            Assert.That(context.IsPresent("scene"), Is.True);
+
+            var result = new GameObjectFindOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        [Test]
+        public void TransformSet_Preflight_PendingSpaceDoesNotThrow()
+        {
+            using var harness = OperationTestHarness.Create();
+            var target = NewGo(harness, "PendingSpace");
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["target"] = InputValue.Present(GoRef(target)),
+                    ["position"] = InputValue.Present(
+                        Json("{\"x\":4,\"y\":0,\"z\":0}")),
+                },
+                TransformIn, NoPorts,
+                pending: new Dictionary<string, string>
+                {
+                    ["space"] = "upstream-space",
+                });
+
+            Assert.That(context.IsPending("space"), Is.True);
+            Assert.That(context.IsPresent("space"), Is.True);
+
+            var result = new TransformSetOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        // The !IsPending guard skips only the read it cannot answer; the
+        // concrete-value diagnostics the same paths already produced are
+        // unchanged (Issue #257).
+        [Test]
+        public void TransformSet_Preflight_ConcreteInvalidSpaceReportsOwOp006()
+        {
+            using var harness = OperationTestHarness.Create();
+            var target = NewGo(harness, "BadSpaceTarget");
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["target"] = InputValue.Present(GoRef(target)),
+                    ["position"] = InputValue.Present(
+                        Json("{\"x\":0,\"y\":0,\"z\":0}")),
+                    ["space"] = InputValue.Present(Json("\"diagonal\"")),
+                },
+                TransformIn, NoPorts);
+
+            var result = new TransformSetOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Has.Count.EqualTo(1));
+            Assert.That(result.Diagnostics[0].Code, Is.EqualTo(ErrorCodes.OW_OP_006));
+            Assert.That(result.Diagnostics[0].Port, Is.EqualTo("space"));
+        }
+
+        [Test]
+        public void TransformSet_Preflight_UnresolvableTargetReportsOwUnity001()
+        {
+            using var harness = OperationTestHarness.Create();
+            var target = NewGo(harness, "VanishedPreflight");
+            var reference = GoRef(target);
+            UnityEngine.Object.DestroyImmediate(target);
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["target"] = InputValue.Present(reference),
+                    ["position"] = InputValue.Present(
+                        Json("{\"x\":0,\"y\":0,\"z\":0}")),
+                },
+                TransformIn, NoPorts);
+
+            var result = new TransformSetOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Not.Empty);
+            Assert.That(result.Diagnostics[0].Code,
+                Is.EqualTo(ErrorCodes.OW_UNITY_001));
+            Assert.That(result.Diagnostics[0].Port, Is.EqualTo("target"));
+        }
+
+        [Test]
+        public void Find_Preflight_UnresolvableSceneReportsOwUnity003()
+        {
+            var context = Context(
+                new Dictionary<string, InputValue>
+                {
+                    ["name"] = InputValue.Present(Json("\"Subject\"")),
+                    ["scene"] = InputValue.Present(
+                        Json("{\"kind\":\"scene\",\"path\":\"Assets/NoSuch.unity\"}")),
+                },
+                FindIn, GoOut);
+
+            var result = new GameObjectFindOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Not.Empty);
+            Assert.That(result.Diagnostics[0].Code,
+                Is.EqualTo(ErrorCodes.OW_UNITY_003));
+            Assert.That(result.Diagnostics[0].Port, Is.EqualTo("scene"));
+        }
 
         // ── unity.gameobject.create ─────────────────────────────────────
 

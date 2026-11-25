@@ -47,8 +47,11 @@ namespace OpWeave.UnityAdapter.Tests
         // The clone's fixture generation stamp: a clone stamped by an
         // older generation — or carrying no stamp at all — cannot be
         // trusted, so it is deleted and rebuilt before reuse. Bump when
-        // the matrix fixture the clone must carry changes.
-        private const string FixtureGeneration = "2";
+        // the matrix fixture the clone must carry changes — including
+        // the clone-hygiene contract itself, since a stamped clone
+        // built before the generated-folder exclusion is dirty by
+        // definition (T-W2.4-11).
+        private const string FixtureGeneration = "3";
         private static string GenerationFile =>
             Path.Combine(AtF07Matrix.ProbeDir, "project.generation");
 
@@ -73,24 +76,37 @@ namespace OpWeave.UnityAdapter.Tests
             var current = Directory.Exists(CloneDir) &&
                 File.Exists(GenerationFile) &&
                 File.ReadAllText(GenerationFile).Trim() == FixtureGeneration;
-            if (current)
+            if (!current)
             {
-                return;
-            }
-            if (Directory.Exists(CloneDir))
-            {
-                try { Directory.Delete(CloneDir, recursive: true); }
-                catch (Exception)
+                if (Directory.Exists(CloneDir))
                 {
-                    // A still-held file stays; the re-clone below merges
-                    // the fresh project over the leftovers.
+                    try { Directory.Delete(CloneDir, recursive: true); }
+                    catch (Exception)
+                    {
+                        // A still-held file stays; the re-clone below merges
+                        // the fresh project over the leftovers.
+                    }
                 }
+                Directory.CreateDirectory(CloneDir);
+                // The exclusion keeps the parent's generated fixture
+                // trees out of the raw copy — residue under the source's
+                // Assets/ otherwise reaches the child as an occupied
+                // never-overwrite target (OW-UNITY-005, T-W2.4-11).
+                EditorProcessHarness.CloneProject(
+                    ProjectRoot, CloneDir, AtF07Matrix.CloneExcludedFolders);
             }
-            Directory.CreateDirectory(CloneDir);
-            EditorProcessHarness.CloneProject(ProjectRoot, CloneDir);
-            // Stamped only after the clone is built, so a later run never
-            // reads a stale clone as current.
-            File.WriteAllText(GenerationFile, FixtureGeneration, s_utf8);
+            // The fail-closed residue guarantee on every path: a stamped
+            // clone REUSED across suite runs still carries what its own
+            // arrange/verify children generated — the same OW-UNITY-005
+            // fatal for the next arrange child as parent residue is.
+            EditorProcessHarness.ScrubProjectDirectories(
+                CloneDir, AtF07Matrix.CloneExcludedFolders);
+            if (!current)
+            {
+                // Stamped only after the clone is built and scrubbed, so
+                // a later run never reads a dirty clone as current.
+                File.WriteAllText(GenerationFile, FixtureGeneration, s_utf8);
+            }
         }
 
         [TearDown]
@@ -213,7 +229,8 @@ namespace OpWeave.UnityAdapter.Tests
 
             var arrange = Launch("arrange-matrix", "block", "arrange");
             var checkpointText = EditorProcessHarness.WaitForFileContent(
-                Path.Combine(JobDir, "checkpoint.json"), CheckpointTimeoutMs);
+                Path.Combine(JobDir, "checkpoint.json"), CheckpointTimeoutMs,
+                watchedProcess: arrange.Process);
             Assert.IsNotNull(
                 checkpointText,
                 "the arrange-matrix child never wrote checkpoint.json; " +
@@ -257,7 +274,8 @@ namespace OpWeave.UnityAdapter.Tests
                 "the verify-matrix child did not exit; output: " +
                 EditorProcessHarness.ChildOutput(verify));
             var verdictText = EditorProcessHarness.WaitForFileContent(
-                Path.Combine(JobDir, "verdicts.json"), 30000);
+                Path.Combine(JobDir, "verdicts.json"), 30000,
+                watchedProcess: verify.Process);
             Assert.IsNotNull(
                 verdictText,
                 "the verify-matrix child never wrote verdicts.json; " +

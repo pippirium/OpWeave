@@ -101,6 +101,22 @@ namespace OpWeave.UnityAdapter.Tests
         internal const string WorkflowId = "example.atf07.matrix";
         internal const string Folder = "Assets/OpWeaveAtf07M";
 
+        // The project-relative generated fixture trees a cloned child
+        // project must never inherit: Folder — this matrix's own
+        // residue — and "Assets/OpWeaveAtf07", the probe folder the
+        // interruption scenarios generate (InterruptionScenarioEntry's
+        // ProbeFolder). A raw File.Copy clone bakes either one into the
+        // child project, and a generation-stamped clone carries its own
+        // previous children's output — both leave the arrange
+        // Operations' never-overwrite targets occupied (OW-UNITY-005).
+        // Shared by every AT-F07 clone fixture so the exclusion and the
+        // fail-closed scrub name the same set.
+        internal static readonly string[] CloneExcludedFolders =
+        {
+            Folder,
+            "Assets/OpWeaveAtf07",
+        };
+
         internal const string PkgName = "com.opweave.fixture.atf07git";
         internal const string PkgTag = "vatf07";
         internal static readonly string[] OpKeys =
@@ -699,13 +715,13 @@ namespace OpWeave.UnityAdapter.Tests
 
         internal static GameObject FindByName(string name) =>
             UnityEngine.Object.FindObjectsByType<Transform>(
-                    FindObjectsInactive.Include)
+                    FindObjectsInactive.Include, FindObjectsSortMode.None)
                 .Select(t => t.gameObject)
                 .FirstOrDefault(g => g.name == name)!;
 
         internal static int CountByName(string name) =>
             UnityEngine.Object.FindObjectsByType<Transform>(
-                    FindObjectsInactive.Include)
+                    FindObjectsInactive.Include, FindObjectsSortMode.None)
                 .Count(t => t.gameObject.name == name);
 
         internal const string BaseScenePath = Folder + "/Base.unity";

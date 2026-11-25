@@ -161,6 +161,28 @@ namespace OpWeave.UnityAdapter.Tests
             return (path, PrefabContentsFixture.GuidOf(path));
         }
 
+        // The §D8 Dry-Run seam T-W2.5-07 added for the GameObject family,
+        // replicated at its smallest here: pendingProducers marks an
+        // edge-fed port whose producing step has not run — counted present,
+        // and a programming error to Get<T>. The pending-guarded Preflight
+        // paths return before the §E6 item 4 resource registry is touched,
+        // so the context carries none.
+        private static UnityStepContext OperationContext(
+            IReadOnlyDictionary<string, InputValue> inputs,
+            IReadOnlyDictionary<string, string> inputTypes,
+            IReadOnlyDictionary<string, string> outputTypes,
+            IReadOnlyDictionary<string, string>? pending = null) =>
+            new UnityStepContext(
+                inputs,
+                inputTypes,
+                outputTypes,
+                RunnerHostFixture.Types,
+                new RefResolver(PrefabContentsResources.FindEditingRoot),
+                new StepChangeRecorder(0, "prefab"),
+                new StepLogSink(
+                    "run", 0, (_, _, _, _) => Result<Unit>.Success(Unit.Value)),
+                pendingProducers: pending);
+
         // ── Operation level: open_contents ──────────────────────────────────
 
         // SPEC §G6 item 5, §E6 item 4: the acquisition is journaled before the
@@ -524,6 +546,97 @@ namespace OpWeave.UnityAdapter.Tests
                 PrefabContentsOwnership.SessionIdOf(foreign!),
                 PrefabContentsOwnership.SessionIdOf(roots[0]),
                 "their session is still open — the save never closed it");
+        }
+
+        // ── Operation level: pending edge-fed inputs (SPEC §D8 item 1) ────
+        //
+        // A Dry-Run pending input is counted present but holds no value:
+        // Preflight must not read it — Get<T> on a pending port throws the
+        // programming-error InvalidOperationException — so the step records
+        // the same empty result a missing port yields, instead of throwing
+        // through ResolveTarget/OpenedContents. The concrete controls prove
+        // the guards mask nothing the read paths already reported:
+        // OpenContents_Preflight_SceneObjectRef_ReportsOwUnity001 below and
+        // SaveContents_RejectsARootThatIsNotOpenedContents above.
+
+        [Test]
+        public void OpenContents_Preflight_PendingPrefab_RecordsNothing()
+        {
+            var context = OperationContext(
+                new Dictionary<string, InputValue>(),
+                new Dictionary<string, string>
+                    { ["prefab"] = "unity.PrefabAssetRef" },
+                new Dictionary<string, string>
+                    { ["root"] = "unity.GameObjectRef" },
+                new Dictionary<string, string>
+                    { ["prefab"] = "upstream-prefab" });
+
+            Assert.That(context.IsPending("prefab"), Is.True);
+            Assert.That(context.IsPresent("prefab"), Is.True);
+
+            var preflight = Standard(OpenId).Preflight(context);
+
+            Assert.That(preflight.Diagnostics, Is.Empty);
+            Assert.That(
+                ((JObject)preflight.Snapshot.ToToken()).Count, Is.EqualTo(0),
+                "a pending target records no §F5 evidence");
+        }
+
+        [Test]
+        public void SaveContents_Preflight_PendingRoot_RecordsNothing()
+        {
+            var context = OperationContext(
+                new Dictionary<string, InputValue>(),
+                new Dictionary<string, string>
+                    { ["root"] = "unity.GameObjectRef" },
+                new Dictionary<string, string>
+                    { ["prefab"] = "unity.PrefabAssetRef" },
+                new Dictionary<string, string>
+                    { ["root"] = "upstream-root" });
+
+            Assert.That(context.IsPending("root"), Is.True);
+            Assert.That(context.IsPresent("root"), Is.True);
+
+            var preflight = Standard(SaveId).Preflight(context);
+
+            Assert.That(preflight.Diagnostics, Is.Empty);
+            Assert.That(
+                ((JObject)preflight.Snapshot.ToToken()).Count, Is.EqualTo(0),
+                "a pending root records no §F5 evidence");
+        }
+
+        // The concrete-value control over the same read path: a Ref that
+        // resolves to a live scene GameObject — never an imported Prefab
+        // asset — keeps its OW-UNITY-001 finding on the port, so the
+        // pending guard masks nothing concrete.
+        [Test]
+        public void OpenContents_Preflight_SceneObjectRef_ReportsOwUnity001()
+        {
+            var plain = new GameObject("NotAPrefabAsset");
+            _scratch.Add(plain);
+            var context = OperationContext(
+                new Dictionary<string, InputValue>
+                {
+                    ["prefab"] = InputValue.Present(
+                        new RefResolver().ToRef(plain, "unity.GameObjectRef")),
+                },
+                new Dictionary<string, string>
+                    { ["prefab"] = "unity.PrefabAssetRef" },
+                new Dictionary<string, string>
+                    { ["root"] = "unity.GameObjectRef" });
+
+            var preflight = Standard(OpenId).Preflight(context);
+
+            Assert.That(
+                preflight.Diagnostics.Any(d => d.Code == ErrorCodes.OW_UNITY_001),
+                Is.True,
+                "a scene GameObject is no imported Prefab asset: " +
+                string.Join("; ", preflight.Diagnostics.Select(
+                    d => d.Code + " " + d.Message)));
+            Assert.AreEqual(
+                "prefab",
+                preflight.Diagnostics.First(
+                    d => d.Code == ErrorCodes.OW_UNITY_001).Port);
         }
 
         // ── The §E6 item 4 release seam ─────────────────────────────────────

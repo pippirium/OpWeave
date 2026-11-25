@@ -21,6 +21,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using NUnit.Framework;
 using OpWeave.Core;
 using OpWeave.Core.Compiler;
@@ -30,6 +31,7 @@ using OpWeave.Core.Registry;
 using OpWeave.Core.Search;
 using OpWeave.UnityAdapter;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEngine.TestTools;
 
 namespace OpWeave.UnityAdapter.Tests
@@ -114,26 +116,256 @@ namespace OpWeave.UnityAdapter.Tests
                 throw new NotSupportedException("No ValidateStatic reads a port.");
         }
 
+        private const double WaitTimeoutSec = 240.0;
+        private const double QuietSettleSec = 5.0;
+
+        // Bound on re-drain/rebuild legs after a build reads a stale or
+        // still-armed stage 1 (T-W2.4-15); each leg's drain stays bounded
+        // by WaitTimeoutSec, so neither loop can wait indefinitely.
+        private const int MaxRebuildLegs = 3;
+
+        // The pending-request flag WaitForDomainReload.Perform polls —
+        // Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the quiet
+        // drain reaches it through reflection (the At01AgentStepsTests
+        // probe, T-W2.4-07). A reload already armed behind the runner's
+        // reload lock surfaces here while isCompiling is false — the
+        // deferred state an isCompiling-only check misses.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    BindingFlags.Static | BindingFlags.Instance |
+                    BindingFlags.Public | BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        // The state a queued compile/reload reports while the runner's
+        // lock holds it: a running script compile always ends in a reload
+        // queued behind the lock, and a requested reload is already
+        // pending — either is one the drain must cross, never ride into
+        // the registry build below.
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling ||
+            CompilationAssembliesPending();
+
+        // The queued-but-unstarted/mid-transition window the two flags
+        // cannot see (T-W2.4-15): a predecessor can arm a compile that has
+        // not yet raised isCompiling or IsScriptReloadRequested, while the
+        // compilation pipeline already refuses to answer — its
+        // GetAssemblies result going null or its query throwing is the
+        // only observable the drain→build gap leaves. Treat an unanswered
+        // pipeline as pending: the drain keeps waiting until the pipeline
+        // serves the query the registry build and the compiler's plan
+        // stage are about to run.
+        private static bool CompilationAssembliesPending()
+        {
+            try
+            {
+                return CompilationPipeline.GetAssemblies(AssembliesType.Editor) is null ||
+                    CompilationPipeline.GetAssemblies(AssembliesType.Player) is null;
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+
+        // The pending probe the quiet drain trusts is only as strong as
+        // its shape: prove it once up front (the At01AgentStepsTests
+        // pattern, T-W2.4-07) so the fixture fails here — before any
+        // test — instead of silently degrading to an isCompiling-only
+        // check that misses a requested reload armed behind the lock.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "this Unity version — the quiet drain cannot prove a " +
+                    "deferred reload is drained");
+            }
+        }
+
+        // These tests never write a script file, so the only work they
+        // can meet here is a leftover handed over by an earlier fixture:
+        // a script compile still in flight or queued behind the runner's
+        // lock, or the asset import in front of one. The sanctioned
+        // bounded conditional drain (the At01AgentStepsTests
+        // DrainEditorState idiom, T-W2.4-07) replaces the unconditional
+        // `yield return new RecompileScripts(false, false)` residual:
+        // that instruction's Perform requests a compile and unlocks the
+        // runner's reload lock even when nothing is queued — and with
+        // ExpectDomainReload=false UTF keeps no resume state, so a
+        // still-pending predecessor reload crossing the unlock abandons
+        // the test on cleared locals. Here a pending compile or
+        // requested reload is crossed only at DrainedScriptReload — the
+        // bounded ExpectDomainReload boundary the caller's relay hands
+        // to UTF at the test body's own top level, where the captured PC
+        // is correct — and everything else settles on bounded plain
+        // frames: a queued compile surfaces as isCompiling a frame or
+        // two after Refresh returns, so the wait only trusts a sustained
+        // quiet spell and a periodic Refresh flushes the import queue so
+        // a queued compile surfaces inside the window, never behind it.
         private static IEnumerator WaitForQuietEditor()
         {
-            yield return new RecompileScripts(false, false);
-            var guard = 0;
-            while (EditorApplication.isCompiling && guard++ < 600)
+            AssetDatabase.Refresh();
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            var quietAt = -1.0;
+            for (;;)
             {
+                if (EditorApplication.timeSinceStartup >= deadline)
+                {
+                    Assert.Fail(
+                        "DescribeServiceLiveRegistryTests.WaitForQuietEditor " +
+                        "timed out after " + WaitTimeoutSec +
+                        " s draining the armed editor state " +
+                        "(scriptReloadRequested: " + ScriptReloadRequested() +
+                        ", isCompiling: " + EditorApplication.isCompiling +
+                        ", isUpdating: " + EditorApplication.isUpdating + ")");
+                }
+                if (ReloadPending())
+                {
+                    // A running or requested compile ends in a reload
+                    // queued behind the runner's lock — cross it at the
+                    // bounded sanctioned boundary, never ride it into
+                    // the registry build.
+                    quietAt = -1.0;
+                    yield return new DrainedScriptReload(
+                        "WaitForQuietEditor", WaitTimeoutSec);
+                    continue;
+                }
+                if (EditorApplication.isUpdating)
+                {
+                    // An import still in flight may surface a compile —
+                    // no quiet counts while it runs.
+                    quietAt = -1.0;
+                }
+                else if (quietAt < 0.0)
+                {
+                    quietAt = EditorApplication.timeSinceStartup;
+                }
+                else if (EditorApplication.timeSinceStartup - quietAt >=
+                         QuietSettleSec)
+                {
+                    break;
+                }
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
                 yield return null;
             }
             Assert.IsFalse(EditorUtility.scriptCompilationFailed,
                 "the live registry cannot build over a failed script compile");
             Assert.IsFalse(EditorApplication.isCompiling,
                 "the live registry cannot build while a compile is in flight");
+            Assert.IsFalse(ScriptReloadRequested(),
+                "the live registry cannot build while a script reload is pending");
+            Assert.IsFalse(CompilationAssembliesPending(),
+                "the live registry cannot build while the compilation " +
+                "pipeline cannot answer its assembly query");
         }
 
-        private static RegistryBuildResult LiveBuild()
+        // The bounded reload-crossing instruction — the
+        // WaitForDomainReload.Perform wait with a deadline, run by UTF
+        // through the IEditModeTestYieldInstruction interface so
+        // ExpectDomainReload arms the runner's reload bookkeeping
+        // exactly as with UTF's own instructions. It is yielded only
+        // after ReloadPending() proved a real reload is armed, so the
+        // unlock below always meets a queued reload and can never strand
+        // the lock released on an idle Editor — the failure mode of the
+        // unconditional RecompileScripts(false, false) unlock it
+        // replaces. The one path where no reload can follow — a failed
+        // compile — re-locks before failing.
+        private sealed class DrainedScriptReload : IEditModeTestYieldInstruction
         {
-            var build = RegistryBuildHost.Rebuild(
+            private readonly string m_phase;
+            private readonly double m_timeoutSec;
+
+            internal DrainedScriptReload(string phase, double timeoutSec)
+            {
+                m_phase = phase;
+                m_timeoutSec = timeoutSec;
+            }
+
+            public bool ExpectDomainReload => true;
+            public bool ExpectedPlaymodeState => false;
+
+            public IEnumerator Perform()
+            {
+                // UTF yields the same first frame: the runner must see
+                // the yielded instruction and arm its expected-domain-
+                // reload bookkeeping before the reload can start.
+                yield return null;
+
+                var deadline =
+                    EditorApplication.timeSinceStartup + m_timeoutSec;
+
+                AssetDatabase.Refresh();
+                EditorApplication.UnlockReloadAssemblies();
+
+                // Wait out the armed state as WaitForDomainReload.Perform
+                // does — while a script reload stays requested or a
+                // compile runs — but bounded: the reload itself kills
+                // the domain mid-wait, so a deadline expiry can only
+                // mean the proven pending state never crossed.
+                while (ReloadPending())
+                {
+                    if (EditorApplication.timeSinceStartup >= deadline)
+                    {
+                        EditorApplication.LockReloadAssemblies();
+                        Assert.Fail(
+                            "DescribeServiceLiveRegistryTests." + m_phase +
+                            " timed out after " + m_timeoutSec +
+                            " s: the proven pending reload never crossed");
+                    }
+                    yield return null;
+                }
+
+                if (EditorUtility.scriptCompilationFailed)
+                {
+                    EditorApplication.LockReloadAssemblies();
+                    Assert.Fail(
+                        "DescribeServiceLiveRegistryTests." + m_phase +
+                        ": script compilation failed");
+                }
+            }
+        }
+
+        // The raw live build — returned unasserted so the bounded
+        // re-drain/rebuild loop in the §C8 pass can inspect Stale and the
+        // armed-editor state before deciding the build is consumable
+        // (T-W2.4-15); LiveBuild keeps the loud contract for the callers
+        // that build once over an already-drained editor.
+        private static RegistryBuildResult RebuildLive() =>
+            RegistryBuildHost.Rebuild(
                 RegistryTypeStage.Production(AutoExtensionExclusion.Instance),
                 RegistryOperationStage.Production(),
                 new RegistryPublication());
+
+        private static RegistryBuildResult LiveBuild()
+        {
+            var build = RebuildLive();
             Assert.IsFalse(build.Stale, "the live registry build must not be stale");
             Assert.IsNotNull(build.Snapshot, "the live registry must publish a snapshot");
             return build;
@@ -146,6 +378,24 @@ namespace OpWeave.UnityAdapter.Tests
                 new UnityTypeProbe(),
                 UnityPlanProvenance.Capture(IntegrityLevel.Weak, build.Providers));
 
+        // The serializable cursor of the judged population: one
+        // (id, version) pair per registered Operation, captured once at
+        // pass start so a mid-pass resume keeps judging the same
+        // population — plain fields, not auto-properties, because the
+        // serializer carries fields.
+        [Serializable]
+        private struct OperationKey
+        {
+            internal OperationKey(string id, int version)
+            {
+                Id = id;
+                Version = version;
+            }
+
+            internal string Id;
+            internal int Version;
+        }
+
         // SPEC §C8: describe every registered Operation and validate each
         // returned example with its declared fixture applied — through
         // this ticket's internal ExampleFixture, which materializes the
@@ -157,85 +407,235 @@ namespace OpWeave.UnityAdapter.Tests
         [UnityTest]
         public IEnumerator EveryExampleOfEveryRegisteredOperationValidatesWithItsFixtureApplied()
         {
-            var waiter = WaitForQuietEditor();
-            while (waiter.MoveNext())
+            // UTF resumes a reload-crossed [UnityTest] enumerator at its
+            // yield with every local reset — a null waiter is that
+            // resume, not a fresh start: rebuild the idempotent wait
+            // and relay on instead of touching the dead reference (the
+            // At01AgentStepsTests DrainEditorState idiom, T-W2.4-07).
+            IEnumerator? waiter = null;
+            for (;;)
             {
+                waiter ??= WaitForQuietEditor();
+                if (!waiter.MoveNext())
+                {
+                    break;
+                }
                 yield return waiter.Current;
             }
 
-            var build = LiveBuild();
-            var snapshot = build.Snapshot!;
-            var service = new OperationDescribeService(snapshot);
-            var compiler = Compiler(build);
-
+            // Issue #629 (T-W2.4-14): the pass below materializes
+            // ExampleFixture assets inside the body, so the quiet-Editor
+            // drain above is not the last word — a compile the
+            // application or a leftover queues can still cross mid-pass,
+            // and a resume then lands the enumerator at the
+            // iteration-top relay with every hoisted local reset or
+            // broken. The pass therefore trusts only serializable state
+            // across the yield — the counters, the label lists and an
+            // (id, version) cursor over the population it started
+            // judging — and rematerializes every live capture (build,
+            // snapshot, describe service, compiler) with ??= after the
+            // yield, never trusting a pre-yield capture. The
+            // ExampleFixture is created, filled and disposed inside one
+            // yield-free iteration span, so a resume can never strand
+            // its asset tracking.
+            RegistryBuildResult? build = null;
+            RegistrySnapshot? snapshot = null;
+            OperationDescribeService? service = null;
+            WorkflowCompiler? compiler = null;
+            List<OperationKey>? operationKeys = null;
+            var opIndex = 0;
+            var judgedIndex = -1;
+            var spanDrainLegs = 0;
             var described = 0;
             var validated = 0;
             var covered = 0;
             var coveredStandard = 0;
-            var coveredLabels = new List<string>();
-            var testSupportLabels = new List<string>();
-            var problems = new List<string>();
+            List<string>? coveredLabels = null;
+            List<string>? testSupportLabels = null;
+            List<string>? problems = null;
 
-            using (var fixture = new ExampleFixture())
+            for (;;)
             {
-                foreach (var operation in snapshot.Operations)
+                // The pass's one mid-pass yield: any compile armed since
+                // the last iteration crosses at this drain — never inside
+                // the captured-state span below — and the resume re-runs
+                // the rematerialization before anything is dereferenced.
+                if (ReloadPending())
                 {
-                    var descriptor = operation.Descriptor;
-                    var label = LabelOf(operation);
-                    var isTestSupport = IsCompiledTestSupport(operation);
-
-                    var describe = service.DescribeOperation(
-                        new DescribeOperationRequest(descriptor.Id)
+                    IEnumerator? midDrain = null;
+                    for (;;)
+                    {
+                        midDrain ??= WaitForQuietEditor();
+                        if (!midDrain.MoveNext())
                         {
-                            Version = descriptor.Version,
-                        });
-                    if (!describe.Ok)
-                    {
-                        problems.Add(label + ": " + string.Join("; ",
-                            describe.Diagnostics.Select(
-                                d => d.Code + " " + d.Message)));
-                        continue;
-                    }
-                    described++;
-                    var description = describe.Value!;
-
-                    if (description.RegistryGeneration != snapshot.GenerationId)
-                    {
-                        problems.Add(label +
-                            ": the description must carry the answering generation");
-                    }
-                    // The test-support label only names the probes in the
-                    // report below; it exempts nothing — every registered
-                    // Operation is judged for a complete-WF Example.
-                    if (!isTestSupport)
-                    {
-                        covered++;
-                        coveredLabels.Add(label);
-                        if (string.Equals(operation.AssemblyName, StandardOperationsAssembly,
-                                StringComparison.Ordinal))
-                        {
-                            coveredStandard++;
+                            break;
                         }
+                        yield return midDrain.Current;
                     }
-                    else
-                    {
-                        testSupportLabels.Add(
-                            label + " [" + ProvenanceOf(operation) + "]");
-                    }
+                    // The crossed compile may have replaced the
+                    // registered set: the live captures are dropped and
+                    // rebuilt below while the serializable cursor keeps
+                    // the population the pass started judging.
+                    build = null;
+                    snapshot = null;
+                    service = null;
+                    compiler = null;
+                }
 
-                    var examples = description.Examples;
-                    if (examples is null)
+                // T-W2.4-15 bounded re-drain/rebuild: a compile a
+                // predecessor or a span-internal arming queued can
+                // surface queued-but-unstarted after the last drain —
+                // either it is already visible (Stale build, or the
+                // armed pipeline ReloadPending sees) or it surfaces into
+                // stage 1's view mid-build and the next leg re-drains.
+                // The captures below are materialized only from a build
+                // the proven-quiet stage 1 produced.
+                for (var leg = 0; build is null; leg++)
+                {
+                    build = RebuildLive();
+                    if (!build.Stale && !ReloadPending())
                     {
-                        problems.Add(label + ": the examples section must be populated");
-                        continue;
+                        break;
                     }
-                    if (examples.Count == 0)
+                    if (leg >= MaxRebuildLegs)
                     {
-                        problems.Add(label + ": an Operation registered without a " +
-                            "complete-WF Example is incomplete (SPEC §C1 item 4): " +
-                            ProvenanceOf(operation));
+                        Assert.Fail(
+                            "DescribeServiceLiveRegistryTests: the live " +
+                            "registry build stayed " +
+                            (build.Stale ? "stale" : "over an armed editor") +
+                            " through " + MaxRebuildLegs + " re-drain legs");
                     }
+                    IEnumerator? rebuildDrain = null;
+                    for (;;)
+                    {
+                        rebuildDrain ??= WaitForQuietEditor();
+                        if (!rebuildDrain.MoveNext())
+                        {
+                            break;
+                        }
+                        yield return rebuildDrain.Current;
+                    }
+                    build = null;
+                }
+                Assert.IsFalse(build!.Stale,
+                    "the live registry build must not be stale");
+                Assert.IsNotNull(build.Snapshot,
+                    "the live registry must publish a snapshot");
+                snapshot ??= build.Snapshot!;
+                service ??= new OperationDescribeService(snapshot);
+                compiler ??= Compiler(build!);
+                problems ??= new List<string>();
+                coveredLabels ??= new List<string>();
+                testSupportLabels ??= new List<string>();
+                operationKeys ??= snapshot.Operations
+                    .Select(o => new OperationKey(
+                        o.Descriptor.Id, o.Descriptor.Version))
+                    .ToList();
 
+                if (opIndex >= operationKeys.Count)
+                {
+                    break;
+                }
+                var key = operationKeys[opIndex];
+                var operation = snapshot.Find(key.Id, key.Version);
+                if (operation is null)
+                {
+                    problems.Add(key.Id + "@" + key.Version +
+                        ": the Operation left the registered set across a " +
+                        "mid-pass reload");
+                    opIndex++;
+                    continue;
+                }
+                var descriptor = operation.Descriptor;
+                var label = LabelOf(operation);
+                var isTestSupport = IsCompiledTestSupport(operation);
+
+                // A span-internal arming retries this Operation's whole
+                // judgement (T-W2.4-15): snapshot the counters and list
+                // lengths the iteration adds to, so the retry replays the
+                // Operation exactly once instead of double-counting.
+                if (judgedIndex != opIndex)
+                {
+                    judgedIndex = opIndex;
+                    spanDrainLegs = 0;
+                }
+                var iterDescribed = described;
+                var iterCovered = covered;
+                var iterCoveredStandard = coveredStandard;
+                var iterValidated = validated;
+                var iterProblems = problems.Count;
+                var iterCoveredLabels = coveredLabels.Count;
+                var iterTestSupportLabels = testSupportLabels.Count;
+                var armedInSpan = false;
+
+                var describe = service.DescribeOperation(
+                    new DescribeOperationRequest(descriptor.Id)
+                    {
+                        Version = descriptor.Version,
+                    });
+                if (!describe.Ok)
+                {
+                    problems.Add(label + ": " + string.Join("; ",
+                        describe.Diagnostics.Select(
+                            d => d.Code + " " + d.Message)));
+                    opIndex++;
+                    continue;
+                }
+                described++;
+                if (describe.Value is not { } description)
+                {
+                    problems.Add(label +
+                        ": describe answered ok but carried no description");
+                    opIndex++;
+                    continue;
+                }
+
+                if (description.RegistryGeneration != snapshot.GenerationId)
+                {
+                    problems.Add(label +
+                        ": the description must carry the answering generation");
+                }
+                // The test-support label only names the probes in the
+                // report below; it exempts nothing — every registered
+                // Operation is judged for a complete-WF Example.
+                if (!isTestSupport)
+                {
+                    covered++;
+                    coveredLabels.Add(label);
+                    if (string.Equals(operation.AssemblyName, StandardOperationsAssembly,
+                            StringComparison.Ordinal))
+                    {
+                        coveredStandard++;
+                    }
+                }
+                else
+                {
+                    testSupportLabels.Add(
+                        label + " [" + ProvenanceOf(operation) + "]");
+                }
+
+                var examples = description.Examples;
+                if (examples is null)
+                {
+                    problems.Add(label + ": the examples section must be populated");
+                    opIndex++;
+                    continue;
+                }
+                if (examples.Count == 0)
+                {
+                    problems.Add(label + ": an Operation registered without a " +
+                        "complete-WF Example is incomplete (SPEC §C1 item 4): " +
+                        ProvenanceOf(operation));
+                }
+
+                // One fixture per Operation, created and disposed inside
+                // this yield-free span: the assets every example of the
+                // Operation validates against are materialized, judged
+                // and removed before the next iteration's relay can
+                // resume the body — a resume can never strand the
+                // fixture's asset tracking.
+                using (var fixture = new ExampleFixture())
+                {
                     foreach (var example in examples)
                     {
                         if (example.FixtureManifest is { } manifest)
@@ -253,6 +653,21 @@ namespace OpWeave.UnityAdapter.Tests
                             }
                         }
 
+                        // The fixture's own imports — or a leftover
+                        // arming they flushed — can queue a compile
+                        // inside this yield-free span; the compilation
+                        // pipeline answer Validate's provenance pass is
+                        // about to read may already be gone. The drain
+                        // cannot yield inside the span (a resume would
+                        // strand the fixture's asset tracking), so exit
+                        // deterministically, cross the arming at the
+                        // bounded drain below and replay this Operation.
+                        if (ReloadPending())
+                        {
+                            armedInSpan = true;
+                            break;
+                        }
+
                         var read = WorkflowSerializer.Read(
                             example.WorkflowJson.CanonicalText);
                         if (!read.Ok)
@@ -262,9 +677,15 @@ namespace OpWeave.UnityAdapter.Tests
                                     d => d.Code + " " + d.Message)));
                             continue;
                         }
+                        if (read.Value is null)
+                        {
+                            problems.Add(label + " example '" + example.Title +
+                                "': the parsed example carried no document");
+                            continue;
+                        }
 
                         var report = compiler.Validate(new ValidationRequest(
-                            read.Value!, null, ValidationMode.Static, ActorKind.Agent));
+                            read.Value, null, ValidationMode.Static, ActorKind.Agent));
                         if (!report.Ok)
                         {
                             problems.Add(label + " example '" + example.Title + "': " +
@@ -283,22 +704,75 @@ namespace OpWeave.UnityAdapter.Tests
                         }
                     }
                 }
+                if (armedInSpan)
+                {
+                    // Replay this Operation's judgement exactly once:
+                    // roll back what the abandoned span recorded, cross
+                    // the armed compile at the bounded drain (the
+                    // relay is this body's own top-level yield — UTF
+                    // resumes here with the non-serializable locals
+                    // reset, so the captures are dropped and rebuilt on
+                    // the next iteration), then re-judge the same key.
+                    described = iterDescribed;
+                    covered = iterCovered;
+                    coveredStandard = iterCoveredStandard;
+                    validated = iterValidated;
+                    if (problems.Count > iterProblems)
+                    {
+                        problems.RemoveRange(
+                            iterProblems, problems.Count - iterProblems);
+                    }
+                    if (coveredLabels.Count > iterCoveredLabels)
+                    {
+                        coveredLabels.RemoveRange(
+                            iterCoveredLabels, coveredLabels.Count - iterCoveredLabels);
+                    }
+                    if (testSupportLabels.Count > iterTestSupportLabels)
+                    {
+                        testSupportLabels.RemoveRange(
+                            iterTestSupportLabels, testSupportLabels.Count - iterTestSupportLabels);
+                    }
+                    if (++spanDrainLegs > MaxRebuildLegs)
+                    {
+                        Assert.Fail(
+                            "DescribeServiceLiveRegistryTests: a compile " +
+                            "kept being armed inside " + label +
+                            "'s fixture span through " + MaxRebuildLegs +
+                            " bounded drains");
+                    }
+                    IEnumerator? spanDrain = null;
+                    for (;;)
+                    {
+                        spanDrain ??= WaitForQuietEditor();
+                        if (!spanDrain.MoveNext())
+                        {
+                            break;
+                        }
+                        yield return spanDrain.Current;
+                    }
+                    build = null;
+                    snapshot = null;
+                    service = null;
+                    compiler = null;
+                    continue;
+                }
+                opIndex++;
             }
 
-            Assert.That(problems, Is.Empty, () =>
-                problems.Count + " problem(s) across " + described +
+            Assert.That(problems, Is.Empty,
+                problems!.Count + " problem(s) across " + described +
                 " described Operations (" + covered + " shipped-catalog, custom " +
                 "and extension Operations under SPEC §C1 item 4; " +
-                testSupportLabels.Count + " compiled test-support probes judged " +
+                testSupportLabels!.Count + " compiled test-support probes judged " +
                 "the same way: " + string.Join(", ", testSupportLabels) +
-                "):\n" + string.Join("\n", problems));
+                "):\n" + string.Join("\n", problems!));
             Assert.Greater(described, 0, "the live registry must register Operations");
             Assert.Greater(validated, 0,
                 "the live registry must publish at least one example");
-            Assert.That(covered, Is.GreaterThan(30), () =>
+            Assert.That(covered, Is.GreaterThan(30),
                 "SPEC §C1 item 4 must cover the shipped catalog, the AT-01 custom " +
                 "Operation and every registered extension, not only the compiled " +
-                "test support (" + testSupportLabels.Count +
+                "test support (" + testSupportLabels!.Count +
                 " probes registered from *.Tests assemblies)");
             Assert.Greater(coveredStandard, 0,
                 StandardOperationsAssembly + "'s Operations are inside the " +
@@ -336,9 +810,19 @@ namespace OpWeave.UnityAdapter.Tests
         [UnityTest]
         public IEnumerator LiveRegistryJudgedPopulation_NeverRegistersAnOperationWithoutAnExample()
         {
-            var waiter = WaitForQuietEditor();
-            while (waiter.MoveNext())
+            // UTF resumes a reload-crossed [UnityTest] enumerator at its
+            // yield with every local reset — a null waiter is that
+            // resume, not a fresh start: rebuild the idempotent wait
+            // and relay on instead of touching the dead reference (the
+            // At01AgentStepsTests DrainEditorState idiom, T-W2.4-07).
+            IEnumerator? waiter = null;
+            for (;;)
             {
+                waiter ??= WaitForQuietEditor();
+                if (!waiter.MoveNext())
+                {
+                    break;
+                }
                 yield return waiter.Current;
             }
 
@@ -351,7 +835,7 @@ namespace OpWeave.UnityAdapter.Tests
                 FixtureOperationId + " is defined inside an extension package, so the " +
                 "test-support boundary never reaches it and it is judged by §C1 item 4: " +
                 ProvenanceOf(fixtureOperation!));
-            Assert.That(fixtureOperation!.Descriptor.Examples, Is.Not.Empty, () =>
+            Assert.That(fixtureOperation!.Descriptor.Examples, Is.Not.Empty,
                 FixtureOperationId + " registers on every suite run from the persistent " +
                 "embedded package, so SPEC §C1 item 4 requires its own complete-WF " +
                 "Example: " + ProvenanceOf(fixtureOperation!));
@@ -384,7 +868,7 @@ namespace OpWeave.UnityAdapter.Tests
                 .Where(o => o.Descriptor.Examples.Count == 0)
                 .Select(o => LabelOf(o) + " [" + ProvenanceOf(o) + "]")
                 .ToList();
-            Assert.That(exampleLess, Is.Empty, () =>
+            Assert.That(exampleLess, Is.Empty,
                 "every registered Operation must publish a complete-WF Example " +
                 "(SPEC §C1 item 4): " + string.Join(", ", exampleLess));
 
@@ -395,7 +879,7 @@ namespace OpWeave.UnityAdapter.Tests
                 .Where(o => IsCompiledTestSupport(o))
                 .Select(o => LabelOf(o) + " [" + ProvenanceOf(o) + "]")
                 .ToList();
-            Assert.That(testSupport, Is.Not.Empty, () =>
+            Assert.That(testSupport, Is.Not.Empty,
                 "the test-support label must identify the probe Operations of " +
                 "the compiled *.Tests assemblies — they are judged by the " +
                 "example rule like everything else (" +

@@ -463,7 +463,10 @@ namespace OpWeave.Operations
             }
             // Read through the port's resolved value rather than re-reading,
             // so a defaulted "fail" and a written "fail" behave identically.
-            var mode = ctx.IsPresent(DirtyScenesPort)
+            // A pending edge-fed port has no value yet (SPEC §D8 item 1) and
+            // takes the same "fail" default.
+            var mode = ctx.IsPresent(DirtyScenesPort) &&
+                !ctx.IsPending(DirtyScenesPort)
                 ? ctx.Get<string>(DirtyScenesPort)
                 : DirtyScenesFail;
             if (!string.Equals(mode, DirtyScenesSave, StringComparison.Ordinal))

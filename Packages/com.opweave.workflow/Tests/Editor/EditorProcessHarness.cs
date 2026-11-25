@@ -110,15 +110,27 @@ namespace OpWeave.UnityAdapter.Tests
         /// in the source project, so the clone still runs this checkout's
         /// package no matter where the clone directory lives. Library/ is
         /// never copied: the child rebuilds it.
+        /// <paramref name="excludedProjectDirectories"/> names generated
+        /// fixture trees (project-relative, e.g. "Assets/OpWeaveAtf07M")
+        /// the raw copy must never carry into the clone: residue left
+        /// under the source's Assets/ otherwise reaches the child as an
+        /// occupied never-overwrite target (OW-UNITY-005), and a
+        /// generation-stamped clone then keeps it across runs. The set is
+        /// deliberately explicit — tracked fixtures such as
+        /// Assets/OpWeaveFixtures keep cloning.
         /// </summary>
-        internal static void CloneProject(string sourceProject, string cloneProject)
+        internal static void CloneProject(
+            string sourceProject,
+            string cloneProject,
+            IReadOnlyCollection<string>? excludedProjectDirectories = null)
         {
+            var excluded = ExcludedPaths(sourceProject, excludedProjectDirectories);
             CopyDirectory(Path.Combine(sourceProject, "Assets"),
-                Path.Combine(cloneProject, "Assets"));
+                Path.Combine(cloneProject, "Assets"), excluded);
             CopyDirectory(Path.Combine(sourceProject, "Packages"),
-                Path.Combine(cloneProject, "Packages"));
+                Path.Combine(cloneProject, "Packages"), excluded);
             CopyDirectory(Path.Combine(sourceProject, "ProjectSettings"),
-                Path.Combine(cloneProject, "ProjectSettings"));
+                Path.Combine(cloneProject, "ProjectSettings"), excluded);
             var sourcePackages = Path.Combine(sourceProject, "Packages");
             RewriteFileDependencies(
                 Path.Combine(cloneProject, "Packages", "manifest.json"), sourcePackages);
@@ -157,7 +169,28 @@ namespace OpWeave.UnityAdapter.Tests
             }
         }
 
-        private static void CopyDirectory(string source, string destination)
+        // The raw copy skips the generated fixture trees the caller names:
+        // project-relative directories ("Assets/OpWeaveAtf07M") normalized
+        // to full paths so the walk's per-directory comparison is
+        // separator- and case-safe on both hosts.
+        private static HashSet<string> ExcludedPaths(
+            string sourceProject, IReadOnlyCollection<string>? projectRelative)
+        {
+            var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (projectRelative is not null)
+            {
+                foreach (var relative in projectRelative)
+                {
+                    excluded.Add(Path.GetFullPath(Path.Combine(
+                        sourceProject,
+                        relative.Replace('/', Path.DirectorySeparatorChar))));
+                }
+            }
+            return excluded;
+        }
+
+        private static void CopyDirectory(
+            string source, string destination, ISet<string>? excluded)
         {
             Directory.CreateDirectory(destination);
             foreach (var file in Directory.GetFiles(source))
@@ -169,9 +202,49 @@ namespace OpWeave.UnityAdapter.Tests
             }
             foreach (var directory in Directory.GetDirectories(source))
             {
+                if (excluded is not null &&
+                    excluded.Contains(Path.GetFullPath(directory)))
+                {
+                    continue;
+                }
                 CopyDirectory(
                     directory,
-                    Path.Combine(destination, Path.GetFileName(directory)));
+                    Path.Combine(destination, Path.GetFileName(directory)),
+                    excluded);
+            }
+        }
+
+        /// <summary>
+        /// The fail-closed complement of <see cref="CloneProject"/>'s
+        /// exclusion: deletes the named project-relative generated trees
+        /// from <paramref name="projectDir"/> outright. The copy exclusion
+        /// keeps the parent's residue out of a FRESH clone only — a
+        /// generation-stamped clone reused across runs still carries what
+        /// its own earlier children generated, the same occupied-path
+        /// (OW-UNITY-005) fatal for the next arrange child. A failed
+        /// delete throws rather than leaving the residue to fail quietly
+        /// downstream.
+        /// </summary>
+        internal static void ScrubProjectDirectories(
+            string projectDir, IReadOnlyCollection<string> projectRelative)
+        {
+            foreach (var relative in projectRelative)
+            {
+                var disk = Path.Combine(
+                    projectDir,
+                    relative.Replace('/', Path.DirectorySeparatorChar));
+                if (Directory.Exists(disk))
+                {
+                    Directory.Delete(disk, recursive: true);
+                }
+                // The folder's .meta is residue too — left alone it
+                // rebinds a stale guid when the child recreates the
+                // folder.
+                var meta = disk + ".meta";
+                if (File.Exists(meta))
+                {
+                    File.Delete(meta);
+                }
             }
         }
 
@@ -279,9 +352,15 @@ namespace OpWeave.UnityAdapter.Tests
         /// non-empty text, or the deadline passes (returns null). A
         /// transient IOException or a still-empty file is "not ready yet",
         /// retried — the child may have just renamed the file into place.
+        /// When <paramref name="watchedProcess"/> is the child whose
+        /// protocol writes the file, its exit short-circuits the wait: a
+        /// dead child never produces the marker, so polling to the
+        /// deadline would only freeze the parent Editor's main thread for
+        /// the whole window.
         /// </summary>
         internal static string? WaitForFileContent(
-            string path, int timeoutMs, int pollMs = 200)
+            string path, int timeoutMs, int pollMs = 200,
+            Process? watchedProcess = null)
         {
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             while (DateTime.UtcNow < deadline)
@@ -300,6 +379,14 @@ namespace OpWeave.UnityAdapter.Tests
                 catch (IOException)
                 {
                     // Not readable yet — the writer still holds it.
+                }
+                if (watchedProcess is not null && watchedProcess.HasExited)
+                {
+                    // The writer is gone: the marker can never arrive.
+                    // The caller's own evidence path (fatal.txt, the
+                    // child's -logFile and its drained output) reports
+                    // the real failure.
+                    return null;
                 }
                 Thread.Sleep(pollMs);
             }

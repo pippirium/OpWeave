@@ -637,6 +637,23 @@ namespace OpWeave.UnityAdapter.Tests
                 "Library", "OpWeavePrefabCreateProbe");
         private static string SnapshotPath(string name) =>
             Path.Combine(ProbeDir, name + ".json");
+        private static string SessionProbePath() =>
+            Path.Combine(ProbeDir, "session.txt");
+
+        // T-W2.4-09: a per-Editor-session token phase-1 stores in SessionState
+        // and writes into the session probe file beside the persisted snapshot
+        // (a single JSON document that cannot carry the token); phase-2 reads
+        // both to prove the persisted state belongs to this session's phase-1
+        // rather than residue of an earlier run.
+        private const string ProbeTokenKey = "OpWeave.W2409.PrefabCreate.ProbeToken";
+
+        // Bound on phase-1 re-drive legs after a predecessor's stale resume is
+        // detected. leg is a method local, so a real reload resets it; the
+        // this-session probe check is what actually ends the loop.
+        private const int MaxReDriveLegs = 3;
+
+        private static void Crumb(string message) =>
+            UnityEngine.Debug.Log("[W2409-create] " + message);
         private static string MarkerDir =>
             Path.Combine(
                 Path.GetFullPath(Path.Combine(Application.dataPath, "..")),
@@ -644,8 +661,11 @@ namespace OpWeave.UnityAdapter.Tests
 
         private static void PersistSnapshot(string name, JsonValue snapshot)
         {
+            var token = System.Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeTokenKey, token);
             Directory.CreateDirectory(ProbeDir);
             File.WriteAllText(SnapshotPath(name), snapshot.CanonicalText);
+            File.WriteAllText(SessionProbePath(), token + "\n");
         }
 
         private static JsonValue ReadSnapshot(string name)
@@ -742,6 +762,22 @@ namespace OpWeave.UnityAdapter.Tests
         {
             try
             {
+                var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+                if (!File.Exists(SnapshotPath(which)))
+                {
+                    return expectedToken.Length == 0
+                        ? "phase-1 never executed in this Editor session (" +
+                            SnapshotPath(which) + " was never written; probeDir exists=" +
+                            Directory.Exists(ProbeDir) + ")"
+                        : "the persisted snapshot " + SnapshotPath(which) +
+                            " was deleted after phase-1 wrote it";
+                }
+                if (expectedToken.Length == 0 || !File.Exists(SessionProbePath()) ||
+                    File.ReadAllText(SessionProbePath()).Trim() != expectedToken)
+                {
+                    return "the persisted probe state is stale — a previous " +
+                        "Editor session wrote " + SessionProbePath();
+                }
                 var snapshot = ReadSnapshot(which);
                 ReconcileResult verdict;
                 switch (which)
@@ -790,40 +826,95 @@ namespace OpWeave.UnityAdapter.Tests
         private IEnumerator ReloadRoundTrip(string which)
         {
             var before = PhaseBeforeReload(which);
+            Crumb(which + " phase-1 returned: " + before);
             Assert.That(before, Is.Empty, "pre-reload phase failed");
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (s_sentinel is not null && guard++ < 10000)
+
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC applies to this fresh enumerator and lands it at one of
+            // the two post-yield states inside this loop — with every local
+            // (leg included) reset to default. Both continuations drain, then
+            // MUST pass the this-session probe check: a probe phase-1 never
+            // wrote re-drives a real phase-1 + compile + reload instead of
+            // skipping silently into phase-2. If the probe still cannot be
+            // produced after the bound, the loop exits and phase-2's existing
+            // never-executed diagnostic fails loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (s_sentinel is not null && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsNull(s_sentinel, "the marker compile did not produce a domain reload");
+
+                if (ProbeWrittenThisSession(which) || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // A marker file an abandoned leg left behind carries identical
+                // bytes, so deleting the probe assets guarantees the re-write
+                // queues a real compile rather than a no-op Refresh.
+                CleanupReloadArtifacts();
+                var redrive = PhaseBeforeReload(which);
+                Crumb(which + " phase-1 re-drive leg=" + (leg + 1) + " -> " + redrive);
+                Assert.That(redrive, Is.Empty,
+                    "re-driven pre-reload phase failed: " + redrive);
             }
-            Assert.IsNull(s_sentinel, "the marker compile did not produce a domain reload");
+
             var after = PhaseAfterReload(which);
+            Crumb(which + " phase-2 returned: " + after);
             Assert.That(after, Is.Empty, "post-reload phase failed");
+        }
+
+        // The phase-1 probe proves THIS test's phase-1 ran in THIS Editor
+        // session: the per-variant snapshot file must exist AND the session
+        // file's content must equal the token phase-1 stored in SessionState.
+        // Both Library/ and SessionState survive the reload, so a
+        // stale-resume hijack (phase-1 skipped: no file, no token) and residue
+        // of an earlier session — or of the sibling reload test, which shares
+        // the same SessionState — fail the check and the caller re-drives a
+        // real phase-1 instead of skipping into phase-2.
+        private static bool ProbeWrittenThisSession(string which)
+        {
+            if (!File.Exists(SnapshotPath(which)) || !File.Exists(SessionProbePath()))
+            {
+                return false;
+            }
+            var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+            return expectedToken.Length > 0 &&
+                File.ReadAllText(SessionProbePath()).Trim() == expectedToken;
         }
 
         // A failed phase must never poison the next test: the UnitySetUp /
         // UnityTearDown pair sweeps the persisted snapshot, the marker
         // script and the probe assets whatever the test asserted (the
-        // GameObjectReconcileTests pattern), then awaits the recompile the
-        // marker removal schedules. Returns true when a script asset went
-        // away and the domain will reload.
+        // GameObjectReconcileTests pattern). Setup and teardown must never
+        // yield an ExpectDomainReload instruction (RecompileScripts): UTF's
+        // PrepareForDomainReload records the CURRENT TestEnumerator's program
+        // counter — still a different test's method enumerator during setup
+        // and teardown — and the resume then applies that stale PC to the
+        // next test method's fresh enumerator, jumping it past phase-1
+        // entirely when the captured enumerator was abandoned mid-state. The
+        // marker deletion queues its compile under the runner's
+        // LockReloadAssemblies, so the reload it needs drains at the next
+        // test body's own `yield return new RecompileScripts()`, whose
+        // captured PC is the correct one.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            if (CleanupReloadArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("setup cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
+            CleanupReloadArtifacts();
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            if (CleanupReloadArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("teardown cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
+            CleanupReloadArtifacts();
+            yield break;
         }
 
         private static bool CleanupReloadArtifacts()

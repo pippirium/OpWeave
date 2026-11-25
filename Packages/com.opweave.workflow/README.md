@@ -30,6 +30,15 @@ Unity-ignored folders `Editor/Templates~/`, `Schemas~/` and `Samples~/` carry
 `.gitkeep` files so Git retains the layout required by SPEC §0.5 (no `.meta`
 files are needed there since Unity never imports `~`-suffixed folders).
 
+## Creating a graph asset
+
+On Unity 6000.5+, use **Assets > Create > OpWeave > Graph** (also in the
+Project window's right-click Create menu) to create a `*.opweavegraph` in
+the selected folder; Unity shows the standard inline rename. Double-click
+the asset to open it in the Graph Toolkit editor and save it with Ctrl+S
+(SPEC §H6 item 6). A new graph is not linked to any `.opweave.json`:
+creation, rename and Ctrl+S never write JSON.
+
 ## Saving workflow JSON
 
 The `.opweave.json` document an `.opweavegraph` is linked to is written only by

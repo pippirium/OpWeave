@@ -467,6 +467,251 @@ namespace OpWeave.UnityAdapter.Tests
                 "§I.1 declares Undo None");
         }
 
+        // ── pending edge-fed inputs (SPEC §D8 item 1) ────────────────────
+        //
+        // A Dry-Run pending input is counted present but holds no value:
+        // Preflight must not read it — Get<T> on a pending port is the
+        // programming-error InvalidOperationException — and takes the
+        // port's declared default instead, the same answer a missing
+        // optional port gives. The concrete-value controls beside them
+        // prove the guards mask nothing the same paths already reported.
+
+        [Test]
+        public void Open_Preflight_PendingMode_TakesTheSingleDefault()
+        {
+            var path = CreateSavedScene(ProbeFolder + "/PendingMode.unity");
+            EditorSceneManager.MarkSceneDirty(
+                SceneManager.GetSceneByPath(BaseScenePath));
+            var context = Context(
+                new OpenSceneOperation().Descriptor,
+                Inputs(("path", path)),
+                SceneOut,
+                pending: new Dictionary<string, string>
+                {
+                    ["mode"] = "upstream-mode",
+                });
+
+            Assert.That(context.IsPending("mode"), Is.True);
+            Assert.That(context.IsPresent("mode"), Is.True);
+
+            var result = new OpenSceneOperation().Preflight(context);
+
+            // The pending mode takes its "single" default, so the dirty
+            // scene triggers the dirtyScenes="fail" refusal a missing mode
+            // would — never a read of the pending placeholder.
+            Assert.That(result.Diagnostics.Select(d => d.Code),
+                Contains.Item(ErrorCodes.OW_UNITY_011));
+            Assert.That(
+                result.Diagnostics.First(
+                    d => d.Code == ErrorCodes.OW_UNITY_011).Port,
+                Is.EqualTo("dirtyScenes"));
+        }
+
+        [Test]
+        public void Open_Preflight_PendingDirtyScenes_TakesTheFailDefault()
+        {
+            var path = CreateSavedScene(ProbeFolder + "/PendingDirty.unity");
+            EditorSceneManager.MarkSceneDirty(
+                SceneManager.GetSceneByPath(BaseScenePath));
+            var context = Context(
+                new OpenSceneOperation().Descriptor,
+                Inputs(("path", path), ("mode", "single")),
+                SceneOut,
+                pending: new Dictionary<string, string>
+                {
+                    ["dirtyScenes"] = "upstream-dirty",
+                });
+
+            Assert.That(context.IsPending("dirtyScenes"), Is.True);
+            Assert.That(context.IsPresent("dirtyScenes"), Is.True);
+
+            var result = new OpenSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics.Select(d => d.Code),
+                Contains.Item(ErrorCodes.OW_UNITY_011));
+            Assert.That(
+                result.Diagnostics.First(
+                    d => d.Code == ErrorCodes.OW_UNITY_011).Port,
+                Is.EqualTo("dirtyScenes"));
+        }
+
+        // The concrete-value control over the same fixture: a written
+        // "additive" mode is read, so dirty scenes never enter the check.
+        [Test]
+        public void Open_Preflight_ConcreteAdditiveMode_ReportsNoRefusal()
+        {
+            var path = CreateSavedScene(ProbeFolder + "/Additive.unity");
+            EditorSceneManager.MarkSceneDirty(
+                SceneManager.GetSceneByPath(BaseScenePath));
+            var context = Context(
+                new OpenSceneOperation().Descriptor,
+                Inputs(("path", path), ("mode", "additive")),
+                SceneOut);
+
+            var result = new OpenSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        // And a written "save" is read: dirty scenes with paths pass the
+        // single-mode check the pending default refused.
+        [Test]
+        public void Open_Preflight_ConcreteSaveDirtyScenes_ReportsNoRefusal()
+        {
+            var path = CreateSavedScene(ProbeFolder + "/SaveDirty.unity");
+            EditorSceneManager.MarkSceneDirty(
+                SceneManager.GetSceneByPath(BaseScenePath));
+            var context = Context(
+                new OpenSceneOperation().Descriptor,
+                Inputs(
+                    ("path", path), ("mode", "single"), ("dirtyScenes", "save")),
+                SceneOut);
+
+            var result = new OpenSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        [Test]
+        public void Close_Preflight_PendingDirtyScenes_TakesTheFailDefault()
+        {
+            var other = CreateSavedScene(ProbeFolder + "/ClosePending.unity");
+            var loaded = EditorSceneManager.OpenScene(other, OpenSceneMode.Additive);
+            Assert.That(loaded.isLoaded, Is.True,
+                "the fixture must load the dirty target");
+            EditorSceneManager.MarkSceneDirty(loaded);
+            var context = Context(
+                new CloseSceneOperation().Descriptor,
+                Inputs(("scene", SceneRefJson(other))),
+                NoOutputs,
+                pending: new Dictionary<string, string>
+                {
+                    ["dirtyScenes"] = "upstream-dirty",
+                });
+
+            Assert.That(context.IsPending("dirtyScenes"), Is.True);
+            Assert.That(context.IsPresent("dirtyScenes"), Is.True);
+
+            var result = new CloseSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics.Select(d => d.Code),
+                Contains.Item(ErrorCodes.OW_UNITY_011));
+            Assert.That(
+                result.Diagnostics.First(
+                    d => d.Code == ErrorCodes.OW_UNITY_011).Port,
+                Is.EqualTo("dirtyScenes"));
+        }
+
+        // The concrete-value control over the same fixture: a written
+        // "save" is read, so the dirty target passes the check.
+        [Test]
+        public void Close_Preflight_ConcreteSaveDirtyScenes_ReportsNoRefusal()
+        {
+            var other = CreateSavedScene(ProbeFolder + "/CloseSave.unity");
+            var loaded = EditorSceneManager.OpenScene(other, OpenSceneMode.Additive);
+            Assert.That(loaded.isLoaded, Is.True,
+                "the fixture must load the dirty target");
+            EditorSceneManager.MarkSceneDirty(loaded);
+            var context = Context(
+                new CloseSceneOperation().Descriptor,
+                Inputs(("scene", SceneRefJson(other)), ("dirtyScenes", "save")),
+                NoOutputs);
+
+            var result = new CloseSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+        }
+
+        [Test]
+        public void Create_Preflight_PendingMode_TakesTheAdditiveDefault()
+        {
+            var context = Context(
+                new CreateSceneOperation().Descriptor,
+                Inputs(("path", ProbeFolder + "/PendingMode.unity")),
+                SceneOut,
+                pending: new Dictionary<string, string>
+                {
+                    ["mode"] = "upstream-mode",
+                });
+
+            Assert.That(context.IsPending("mode"), Is.True);
+            Assert.That(context.IsPresent("mode"), Is.True);
+
+            var result = new CreateSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+            Assert.That(
+                (string?)result.Snapshot.ToToken()["mode"],
+                Is.EqualTo("additive"),
+                "the pending mode is recorded as its declared default");
+        }
+
+        [Test]
+        public void Create_Preflight_PendingSetup_TakesTheDefaultSetup()
+        {
+            var context = Context(
+                new CreateSceneOperation().Descriptor,
+                Inputs(("path", ProbeFolder + "/PendingSetup.unity")),
+                SceneOut,
+                pending: new Dictionary<string, string>
+                {
+                    ["setup"] = "upstream-setup",
+                });
+
+            Assert.That(context.IsPending("setup"), Is.True);
+            Assert.That(context.IsPresent("setup"), Is.True);
+
+            var result = new CreateSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+            Assert.That(
+                (string?)result.Snapshot.ToToken()["setup"],
+                Is.EqualTo("default"),
+                "the pending setup is recorded as its declared default");
+        }
+
+        // The concrete-value control over the same fixture: a written
+        // "single" mode is read, so the dirty scene refuses the create the
+        // pending additive default would allow.
+        [Test]
+        public void Create_Preflight_ConcreteSingleMode_ReportsOwUnity011()
+        {
+            EditorSceneManager.MarkSceneDirty(
+                SceneManager.GetSceneByPath(BaseScenePath));
+            var context = Context(
+                new CreateSceneOperation().Descriptor,
+                Inputs(
+                    ("path", ProbeFolder + "/ConcreteSingle.unity"),
+                    ("mode", "single")),
+                SceneOut);
+
+            var result = new CreateSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics.Select(d => d.Code),
+                Contains.Item(ErrorCodes.OW_UNITY_011));
+        }
+
+        // And a written "empty" setup is read into the snapshot, where the
+        // pending default recorded "default" and its expected roots.
+        [Test]
+        public void Create_Preflight_ConcreteEmptySetup_RecordsEmpty()
+        {
+            var context = Context(
+                new CreateSceneOperation().Descriptor,
+                Inputs(
+                    ("path", ProbeFolder + "/ConcreteEmpty.unity"),
+                    ("setup", "empty")),
+                SceneOut);
+
+            var result = new CreateSceneOperation().Preflight(context);
+
+            Assert.That(result.Diagnostics, Is.Empty);
+            var snapshot = result.Snapshot.ToToken();
+            Assert.That((string?)snapshot["setup"], Is.EqualTo("empty"));
+            Assert.That((JArray)snapshot["expectedRoots"]!, Is.Empty,
+                "the empty setup expects no roots");
+        }
+
         // ── fixtures ─────────────────────────────────────────────────────
 
         // Creates and saves a new scene additively at the path, then closes
@@ -504,7 +749,8 @@ namespace OpWeave.UnityAdapter.Tests
             OperationDescriptor descriptor,
             IReadOnlyDictionary<string, InputValue> inputs,
             IReadOnlyDictionary<string, string> outputTypes,
-            IChangeRecorder? changes = null)
+            IChangeRecorder? changes = null,
+            IReadOnlyDictionary<string, string>? pending = null)
         {
             var inputTypes = new Dictionary<string, string>();
             foreach (var port in descriptor.Inputs)
@@ -519,7 +765,8 @@ namespace OpWeave.UnityAdapter.Tests
                 new RefResolver(),
                 changes ?? new StepChangeRecorder(0, "scene"),
                 new StepLogSink(
-                    "run", 0, (_, _, _, _) => Result<Unit>.Success(Unit.Value)));
+                    "run", 0, (_, _, _, _) => Result<Unit>.Success(Unit.Value)),
+                pendingProducers: pending);
         }
 
         private static void AssertSceneRef(JsonValue output, string path)

@@ -89,6 +89,15 @@ namespace OpWeave.Operations
         /// <inheritdoc/>
         public override PreflightResult Preflight(StepContext ctx)
         {
+            // SPEC §D8 item 1: an edge-fed prefab has no value until its
+            // producer runs, so the Dry Run records no target evidence for
+            // the step — the same empty result a missing port yields.
+            if (ctx.IsPending("prefab"))
+            {
+                return new PreflightResult(
+                    Array.Empty<Diagnostic>(), Array.Empty<PlannedChange>(),
+                    PrefabContentsSnapshots.Empty);
+            }
             var target = ResolveTarget(ctx);
             if (!target.Ok)
             {

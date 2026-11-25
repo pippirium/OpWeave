@@ -67,6 +67,15 @@ namespace OpWeave.Operations
         /// <inheritdoc/>
         public override PreflightResult Preflight(StepContext ctx)
         {
+            // SPEC §D8 item 1: an edge-fed root has no value until its
+            // producer runs, so the Dry Run records no session evidence for
+            // the step — the same empty result a missing port yields.
+            if (ctx.IsPending("root"))
+            {
+                return new PreflightResult(
+                    Array.Empty<Diagnostic>(), Array.Empty<PlannedChange>(),
+                    PrefabContentsSnapshots.Empty);
+            }
             var session = OpenedContents(ctx);
             if (!session.Ok)
             {

@@ -396,6 +396,63 @@ namespace OpWeave.UnityAdapter.Tests
         private static void ArmDomainSentinel() => s_domainSentinel = new object();
         private static bool DomainSentinelAlive => s_domainSentinel is not null;
 
+        // T-W2.4-09: a per-Editor-session token the first phase stores in
+        // SessionState and writes into two probe files — session.txt proving
+        // the probe-assembly phase ran, baseline.txt proving the pre-edit
+        // snapshot phase ran. Each resumed domain reads the matching file to
+        // prove the persisted state belongs to this session rather than
+        // residue of an earlier run (the ChangeSetDomainReloadTests pattern).
+        private const string ProbeTokenKey = "OpWeave.W2409.WeakFingerprint.ProbeToken";
+
+        private static string SessionProbePath => Path.Combine(StateDir, "session.txt");
+
+        private static string BaselineProbePath => Path.Combine(StateDir, "baseline.txt");
+
+        // Bound on re-drive legs after a predecessor's stale resume is
+        // detected. leg is a method local, so a real reload resets it; the
+        // this-session probe check is what actually ends the loop.
+        private const int MaxReDriveLegs = 3;
+
+        private static void Crumb(string message) =>
+            UnityEngine.Debug.Log("[W2409-weak] " + message);
+
+        private static void ArmSessionProbe()
+        {
+            var token = Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeTokenKey, token);
+            Directory.CreateDirectory(StateDir);
+            File.WriteAllText(SessionProbePath, token + "\n");
+        }
+
+        private static void ArmBaselineProbe()
+        {
+            var token = SessionState.GetString(ProbeTokenKey, "");
+            Directory.CreateDirectory(StateDir);
+            File.WriteAllText(BaselineProbePath, token + "\n");
+        }
+
+        private static bool ProbeWrittenThisSession()
+        {
+            if (!File.Exists(SessionProbePath))
+            {
+                return false;
+            }
+            var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+            return expectedToken.Length > 0 &&
+                File.ReadAllText(SessionProbePath).Trim() == expectedToken;
+        }
+
+        private static bool BaselineWrittenThisSession()
+        {
+            if (!File.Exists(BaselineProbePath))
+            {
+                return false;
+            }
+            var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+            return expectedToken.Length > 0 &&
+                File.ReadAllText(BaselineProbePath).Trim() == expectedToken;
+        }
+
         private static bool CleanupProbeArtifacts()
         {
             var dirty = false;
@@ -451,11 +508,16 @@ namespace OpWeave.UnityAdapter.Tests
         }
 
         // Two variants differing only inside method bodies (SPEC §C3 test:
-        // changing only an Execute body must change implementationHash).
+        // changing only an Execute body must change implementationHash). The
+        // guid comment makes every write a real source change: a byte-identical
+        // rewrite — an abandoned leg leaving the same variant on disk — would
+        // queue no compile and the RecompileScripts yield would produce no
+        // domain reload.
         private static void WriteProbeOpsFile(string path, bool secondVariant)
         {
             var marker = secondVariant ? "v2" : "v1";
             File.WriteAllText(path,
+                "// reload probe " + Guid.NewGuid().ToString("N") + "\n" +
                 "#nullable enable\nnamespace OpWeave.FingerprintProbes\n{\n" +
                 "    public static class ProbeOpAlpha\n    {\n" +
                 $"        public static string Body() => \"alpha-{marker}\";\n    }}\n" +
@@ -542,22 +604,56 @@ namespace OpWeave.UnityAdapter.Tests
             return lines;
         }
 
+        // The baseline phase (domain 2): prove the compiled v1 body, snapshot
+        // the fingerprint pass — the BEFORE state of a Registry rebuild — then
+        // write the v2 method bodies and arm the second reload. Called inline
+        // and again for each stale-resume re-drive leg.
+        private static void RecordBaselineAndArmSecondReload()
+        {
+            // Probe types exist now. The edited body must really be the
+            // compiled one ("alpha-v1"), then snapshot the fingerprint pass.
+            Assert.That(
+                LoadType(Probe1Assembly, "OpWeave.FingerprintProbes.ProbeOpAlpha")
+                    .GetMethod("Body")!.Invoke(null, null),
+                Is.EqualTo("alpha-v1"), "probe v1 body was not compiled");
+            Directory.CreateDirectory(StateDir);
+            File.WriteAllLines(BeforeSnapshotFile, SnapshotFingerprints());
+            File.WriteAllLines(BeforeTypeSnapshotFile, SnapshotTypeFingerprints());
+            ArmBaselineProbe();
+
+            // Edit only the method bodies of ProbeOps.cs (Probe1) and arm the
+            // second real domain reload.
+            WriteProbeOpsFile(
+                Path.Combine(ProjectRoot, "Assets", "OpWeaveFingerprintProbe", "Probe1", "ProbeOps.cs"),
+                secondVariant: true);
+            ArmDomainSentinel();
+        }
+
+        // Setup and teardown must never yield an ExpectDomainReload
+        // instruction (RecompileScripts): UTF's PrepareForDomainReload records
+        // the CURRENT TestEnumerator's program counter — still a different
+        // test's method enumerator during setup and teardown — and the resume
+        // then applies that stale PC to the next test method's fresh
+        // enumerator, jumping it past phase-1 entirely when the captured
+        // enumerator was abandoned mid-state. The probe-asset deletions queue
+        // their compile under the runner's LockReloadAssemblies, so the reload
+        // they need drains at the next test body's own
+        // `yield return new RecompileScripts()`, whose captured PC is the
+        // correct one.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            if (CleanupProbeArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("setup cleanup enter; stateDir=" + Directory.Exists(StateDir));
+            CleanupProbeArtifacts();
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            if (CleanupProbeArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("teardown cleanup enter; stateDir=" + Directory.Exists(StateDir));
+            CleanupProbeArtifacts();
+            yield break;
         }
 
         [UnityTest]
@@ -566,39 +662,82 @@ namespace OpWeave.UnityAdapter.Tests
             // Domain 1: create the two probe assemblies and force a real
             // compile + domain reload.
             WriteProbeAssets(secondVariant: false);
+            ArmSessionProbe();
             ArmDomainSentinel();
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
-            {
-                yield return null;
-            }
-            Assert.IsFalse(DomainSentinelAlive, "the probe compile did not produce a domain reload");
 
-            // Domain 2: probe types exist now. The edited body must really be
-            // the compiled one ("alpha-v1"), then snapshot the fingerprint
-            // pass — the BEFORE state of a Registry rebuild.
-            Assert.That(
-                LoadType(Probe1Assembly, "OpWeave.FingerprintProbes.ProbeOpAlpha")
-                    .GetMethod("Body")!.Invoke(null, null),
-                Is.EqualTo("alpha-v1"), "probe v1 body was not compiled");
-            Directory.CreateDirectory(StateDir);
-            File.WriteAllLines(BeforeSnapshotFile, SnapshotFingerprints());
-            File.WriteAllLines(BeforeTypeSnapshotFile, SnapshotTypeFingerprints());
-
-            // Edit only the method bodies of ProbeOps.cs (Probe1) and cross a
-            // second real domain reload.
-            WriteProbeOpsFile(
-                Path.Combine(ProjectRoot, "Assets", "OpWeaveFingerprintProbe", "Probe1", "ProbeOps.cs"),
-                secondVariant: true);
-            ArmDomainSentinel();
-            yield return new RecompileScripts();
-            guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC applies to this fresh enumerator and lands it at one of
+            // the post-yield states inside this loop — with every local (leg
+            // included) reset to default. Each continuation drains, then MUST
+            // pass the this-session probe check: a probe the first phase never
+            // wrote re-drives a real write + compile + reload instead of
+            // skipping silently into the baseline phase. If the probe still
+            // cannot be produced after the bound, the loop exits and the
+            // baseline checks fail loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (DomainSentinelAlive && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive, "the probe compile did not produce a domain reload");
+
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // Deleting the probe assets guarantees the re-write queues a
+                // real compile rather than a no-op Refresh.
+                CleanupProbeArtifacts();
+                WriteProbeAssets(secondVariant: false);
+                ArmSessionProbe();
+                ArmDomainSentinel();
             }
-            Assert.IsFalse(DomainSentinelAlive, "the method-body edit did not produce a domain reload");
+
+            // Domain 2: record the baseline (the compiled v1 fingerprint pass)
+            // and arm the method-body edit's second reload.
+            RecordBaselineAndArmSecondReload();
+
+            // A landed continuation may also have skipped the baseline phase
+            // outright: the baseline probe is checked per leg — a baseline
+            // never written this session re-drives the whole second half:
+            // restore the v1 probe source (the guid comment makes the rewrite
+            // a real compile), cross once to rebuild the v1 domain, then
+            // re-record the baseline and arm the v2 write the loop-top yield
+            // crosses.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
+            {
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (DomainSentinelAlive && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive, "the method-body edit did not produce a domain reload");
+
+                if (BaselineWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                WriteProbeAssets(secondVariant: false);
+                ArmDomainSentinel();
+                yield return new RecompileScripts();
+                var restoreGuard = 0;
+                while (DomainSentinelAlive && restoreGuard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the v1 restore did not produce a domain reload");
+                RecordBaselineAndArmSecondReload();
+            }
+            Assert.That(BaselineWrittenThisSession(),
+                "the persisted baseline probe is missing or stale — the " +
+                "pre-edit snapshot was not written in this Editor session");
 
             // Domain 3: prove the new body executes, rebuild the fingerprint
             // snapshot and compare per candidate.

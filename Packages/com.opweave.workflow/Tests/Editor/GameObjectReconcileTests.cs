@@ -73,6 +73,20 @@ namespace OpWeave.UnityAdapter.Tests
         private static void ArmDomainSentinel() => s_domainSentinel = new object();
         private static bool DomainSentinelAlive => s_domainSentinel is not null;
 
+        // T-W2.4-09: a per-Editor-session token phase-1 stores in SessionState
+        // and writes as the probe file's last line; phase-2 reads both to prove
+        // the file belongs to this session's phase-1 rather than residue of an
+        // earlier run (the ChangeSetDomainReloadTests pattern).
+        private const string ProbeTokenKey = "OpWeave.W2409.GameObject.ProbeToken";
+
+        // Bound on phase-1 re-drive legs after a predecessor's stale resume is
+        // detected. leg is a method local, so a real reload resets it; the
+        // this-session probe check is what actually ends the loop.
+        private const int MaxReDriveLegs = 3;
+
+        private static void Crumb(string message) =>
+            UnityEngine.Debug.Log("[W2409-go] " + message);
+
         // The [UnityTest]'s in-memory harness owner. A real domain reload
         // clears the static with every other — the harness's saved scene and
         // folder are then disk residue for CleanupReloadArtifacts. When the
@@ -555,22 +569,31 @@ namespace OpWeave.UnityAdapter.Tests
             return dirty;
         }
 
+        // Setup and teardown must never yield an ExpectDomainReload
+        // instruction (RecompileScripts): UTF's PrepareForDomainReload records
+        // the CURRENT TestEnumerator's program counter — still a different
+        // test's method enumerator during setup and teardown — and the resume
+        // then applies that stale PC to the next test method's fresh
+        // enumerator, jumping it past phase-1 entirely when the captured
+        // enumerator was abandoned mid-state. The marker deletion queues its
+        // compile under the runner's LockReloadAssemblies, so the reload it
+        // needs drains at the next test body's own
+        // `yield return new RecompileScripts()`, whose captured PC is the
+        // correct one.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            if (CleanupReloadArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("setup cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
+            CleanupReloadArtifacts();
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            if (CleanupReloadArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            Crumb("teardown cleanup enter; probeDir=" + Directory.Exists(ProbeDir));
+            CleanupReloadArtifacts();
+            yield break;
         }
 
         // Phase 1 (pre-reload): run both Reconcilable Operations inside the
@@ -611,11 +634,15 @@ namespace OpWeave.UnityAdapter.Tests
                 }
 
                 Directory.CreateDirectory(ProbeDir);
+                var token = Guid.NewGuid().ToString("N");
+                SessionState.SetString(ProbeTokenKey, token);
                 File.WriteAllText(
                     ProbeFile,
                     scene.path + "\n" +
                     createSnapshot.CanonicalText + "\n" +
-                    deleteSnapshot.CanonicalText + "\n");
+                    deleteSnapshot.CanonicalText + "\n" +
+                    token + "\n");
+                Crumb("probe written: " + ProbeFile);
                 Directory.CreateDirectory(MarkerDisk);
                 File.WriteAllText(
                     Path.Combine(MarkerDisk, "ReloadMarker.cs"), MarkerSource);
@@ -636,11 +663,23 @@ namespace OpWeave.UnityAdapter.Tests
         {
             try
             {
+                var expectedToken = SessionState.GetString(ProbeTokenKey, "");
                 if (!File.Exists(ProbeFile))
                 {
-                    return "the persisted snapshot file is missing";
+                    return expectedToken.Length == 0
+                        ? "phase-1 never executed in this Editor session (" +
+                            ProbeFile + " was never written; probeDir exists=" +
+                            Directory.Exists(ProbeDir) + ")"
+                        : "the persisted probe state " + ProbeFile +
+                            " was deleted after phase-1 wrote it";
                 }
                 var lines = File.ReadAllLines(ProbeFile);
+                if (expectedToken.Length == 0 || lines.Length < 4 ||
+                    lines[3] != expectedToken)
+                {
+                    return "the persisted probe state is stale — a previous " +
+                        "Editor session wrote " + ProbeFile;
+                }
                 var scene = SceneManager.GetSceneByPath(lines[0]);
                 if (!scene.isLoaded)
                 {
@@ -681,23 +720,73 @@ namespace OpWeave.UnityAdapter.Tests
                 ? "Unknown(" + unknown.Reason + ")"
                 : verdict.GetType().Name;
 
+        // The phase-1 probe proves phase-1 ran in THIS Editor session: the file
+        // must exist AND its last line must equal the token phase-1 stored in
+        // SessionState. Both Library/ and SessionState survive the reload, so a
+        // stale-resume hijack (phase-1 skipped: no file, no token) and residue
+        // of an earlier session (file yes, token no) both fail the check — the
+        // caller then re-drives a real phase-1 instead of skipping into
+        // phase-2.
+        private static bool ProbeWrittenThisSession()
+        {
+            if (!File.Exists(ProbeFile))
+            {
+                return false;
+            }
+            var expectedToken = SessionState.GetString(ProbeTokenKey, "");
+            if (expectedToken.Length == 0)
+            {
+                return false;
+            }
+            var lines = File.ReadAllLines(ProbeFile);
+            return lines.Length > 0 && lines[lines.Length - 1] == expectedToken;
+        }
+
         [UnityTest]
         [Timeout(180000)]
         public IEnumerator Reconcile_SurvivesADomainReload()
         {
             var phase1 = RunPhaseBeforeReload();
+            Crumb("phase-1 returned: " + phase1);
             Assert.That(phase1, Is.Empty, "pre-reload phase failed: " + phase1);
 
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+            // T-W2.4-09 stale-resume self-heal: a predecessor's captured UTF
+            // resume PC applies to this fresh enumerator and lands it at one of
+            // the two post-yield states inside this loop — with every local
+            // (leg included) reset to default. Both continuations drain, then
+            // MUST pass the this-session probe check: a probe phase-1 never
+            // wrote re-drives a real phase-1 + compile + reload instead of
+            // skipping silently into phase-2. If the probe still cannot be
+            // produced after the bound, the loop exits and phase-2's existing
+            // never-executed diagnostic fails loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (DomainSentinelAlive && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the probe compile did not produce a domain reload");
+
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // A marker file an abandoned leg left behind carries identical
+                // bytes, so deleting the probe assets guarantees the re-write
+                // queues a real compile rather than a no-op Refresh.
+                CleanupReloadArtifacts();
+                var redrive = RunPhaseBeforeReload();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " -> " + redrive);
+                Assert.That(redrive, Is.Empty,
+                    "re-driven pre-reload phase failed: " + redrive);
             }
-            Assert.IsFalse(DomainSentinelAlive,
-                "the probe compile did not produce a domain reload");
 
             var phase2 = RunPhaseAfterReload();
+            Crumb("phase-2 returned: " + phase2);
             Assert.That(phase2, Is.Empty, "post-reload phase failed: " + phase2);
         }
     }

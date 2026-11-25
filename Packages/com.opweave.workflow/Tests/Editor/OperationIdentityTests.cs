@@ -8,6 +8,7 @@
 // a UPM package — each refusal decided from the attribute alone, so the
 // constructor-call counters stay at 0 (SPEC §C3 rules 3–5).
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -16,6 +17,7 @@ using OpWeave.Core;
 using OpWeave.Core.Operations;
 using OpWeave.Core.Registry;
 using UnityEditor;
+using UnityEngine.TestTools;
 
 namespace OpWeave.UnityAdapter.Tests
 {
@@ -58,6 +60,256 @@ namespace OpWeave.UnityAdapter.Tests
                 RegistryTypeStage.Production(AutoExtensionExclusion.Instance),
                 RegistryOperationStage.Production(),
                 publication);
+        }
+
+        // ── fixture-entry drain (T-W2.4-13) ────────────────────────────
+        //
+        // RebuildProduction reads the production §C3 stage-1 seam — the
+        // real Editor compile state — so a compile a predecessor fixture
+        // left queued behind the runner's reload lock (isCompiling still
+        // false, IsScriptReloadRequested already armed) hands the first
+        // live build a stale stage 1. The UnitySetUp drain below is the
+        // fixture-entry half of the At01AgentStepsTests DrainEditorState
+        // idiom (T-W2.4-07): a pending compile or requested reload is
+        // crossed only at the bounded DrainedScriptReload boundary, and
+        // everything else settles on bounded plain frames inside the
+        // QuietSettle window — before the test body runs at all, plain
+        // [Test] included.
+        private const double WaitTimeoutSec = 240.0;
+        private const double QuietSettleSec = 5.0;
+
+        // The pending-request flag WaitForDomainReload.Perform polls —
+        // Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the drain
+        // reaches it through reflection (the At01AgentStepsTests probe,
+        // T-W2.4-07). A reload already armed behind the runner's reload
+        // lock surfaces here while isCompiling is false — the deferred
+        // state an isCompiling-only check misses.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    BindingFlags.Static | BindingFlags.Instance |
+                    BindingFlags.Public | BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        // The state a queued compile/reload reports while the runner's
+        // lock holds it: a running script compile always ends in a reload
+        // queued behind the lock, and a requested reload is already
+        // pending — either is one the drain must cross, never ride into
+        // a live build below.
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
+
+        // The pending probe the drain trusts is only as strong as its
+        // shape: prove it once up front (the At01AgentStepsTests pattern,
+        // T-W2.4-07) so the fixture fails here — before any test —
+        // instead of silently degrading to an isCompiling-only check
+        // that misses a requested reload armed behind the lock.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "this Unity version — the setup cannot prove a " +
+                    "deferred reload is drained");
+            }
+        }
+
+        // The fixture-entry guard: every test — [Test] and [UnityTest]
+        // alike — starts on a proven-quiet Editor, so the production
+        // stage-1 read in RebuildProduction can never go stale on a
+        // predecessor's queued compile.
+        [UnitySetUp]
+        public IEnumerator UnitySetUp()
+        {
+            // UTF resumes a reload-crossed setup enumerator at its yield
+            // with every local reset — a null drain is that resume, not a
+            // fresh start: rebuild the idempotent drain and relay on
+            // instead of touching the dead reference.
+            IEnumerator? drain = null;
+            for (;;)
+            {
+                drain ??= DrainEditorState(nameof(UnitySetUp));
+                if (!drain.MoveNext())
+                {
+                    break;
+                }
+                yield return drain.Current;
+            }
+        }
+
+        // The contract the fixture hands each of its tests: no pending
+        // script reload, no compile or import in flight and a clean
+        // compile. A pending compile or requested reload is crossed only
+        // at DrainedScriptReload — the bounded instruction that unlocks
+        // once the pending state is proven — and everything else settles
+        // on bounded plain frames. A queued compile surfaces as
+        // isCompiling a frame or two after Refresh returns, so the wait
+        // only trusts a sustained quiet spell (the QuietSettle
+        // convention): quiet flags reset on every busy frame and a
+        // periodic Refresh flushes the import queue so a queued compile
+        // surfaces inside the window, never behind it. The instruction
+        // the nested enumerator produces is yielded DIRECTLY from the
+        // setup's own top level through the caller's MoveNext relay — a
+        // nested yield would never reach Perform — and the whole
+        // sequence is idempotent: a crossed reload resumes the caller's
+        // enumerator at its yield with every local reset, so the caller
+        // rebuilds the drain when it arrives null rather than relaying a
+        // dead reference.
+        private static IEnumerator DrainEditorState(string phase)
+        {
+            AssetDatabase.Refresh();
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            var quietAt = -1.0;
+            for (;;)
+            {
+                if (EditorApplication.timeSinceStartup >= deadline)
+                {
+                    Assert.Fail(
+                        "OperationIdentityTests." + phase +
+                        " timed out after " + WaitTimeoutSec +
+                        " s draining the armed editor state " +
+                        "(scriptReloadRequested: " + ScriptReloadRequested() +
+                        ", isCompiling: " + EditorApplication.isCompiling +
+                        ", isUpdating: " + EditorApplication.isUpdating + ")");
+                }
+                if (ReloadPending())
+                {
+                    // A running or requested compile ends in a reload
+                    // queued behind the runner's lock — cross it at the
+                    // bounded sanctioned boundary, never hand it on.
+                    quietAt = -1.0;
+                    yield return new DrainedScriptReload(
+                        phase, WaitTimeoutSec);
+                    continue;
+                }
+                if (EditorApplication.isUpdating)
+                {
+                    // An import still in flight may surface a compile —
+                    // no quiet counts while it runs.
+                    quietAt = -1.0;
+                }
+                else if (quietAt < 0.0)
+                {
+                    quietAt = EditorApplication.timeSinceStartup;
+                }
+                else if (EditorApplication.timeSinceStartup - quietAt >=
+                         QuietSettleSec)
+                {
+                    break;
+                }
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+            AssertDrainedEditorState(phase);
+        }
+
+        // The terminal clean-state proof: the project compiled clean, no
+        // compile in flight and no script reload still armed behind the
+        // runner's lock — a leftover here is this fixture's failure,
+        // never a later suite index's.
+        private static void AssertDrainedEditorState(string phase)
+        {
+            Assert.IsFalse(EditorUtility.scriptCompilationFailed,
+                "OperationIdentityTests." + phase +
+                ": the project did not compile clean");
+            Assert.IsFalse(EditorApplication.isCompiling,
+                "OperationIdentityTests." + phase +
+                ": a script compile is still running");
+            Assert.IsFalse(ScriptReloadRequested(),
+                "OperationIdentityTests." + phase +
+                ": a script reload is still pending");
+        }
+
+        // The bounded reload-crossing instruction — the
+        // WaitForDomainReload.Perform wait with a deadline, run by UTF
+        // through the IEditModeTestYieldInstruction interface so
+        // ExpectDomainReload arms the runner's reload bookkeeping
+        // exactly as with UTF's own instructions. It is yielded only
+        // after ReloadPending() proved a real reload is armed, so the
+        // unlock below always meets a queued reload and can never strand
+        // the lock released on an idle Editor — the failure mode of the
+        // unconditional RecompileScripts(false) unlock the drain idiom
+        // replaces. The one path where no reload can follow — a failed
+        // compile — re-locks before failing.
+        private sealed class DrainedScriptReload : IEditModeTestYieldInstruction
+        {
+            private readonly string m_phase;
+            private readonly double m_timeoutSec;
+
+            internal DrainedScriptReload(string phase, double timeoutSec)
+            {
+                m_phase = phase;
+                m_timeoutSec = timeoutSec;
+            }
+
+            public bool ExpectDomainReload => true;
+            public bool ExpectedPlaymodeState => false;
+
+            public IEnumerator Perform()
+            {
+                // UTF yields the same first frame: the runner must see
+                // the yielded instruction and arm its expected-domain-
+                // reload bookkeeping before the reload can start.
+                yield return null;
+
+                var deadline =
+                    EditorApplication.timeSinceStartup + m_timeoutSec;
+
+                AssetDatabase.Refresh();
+                EditorApplication.UnlockReloadAssemblies();
+
+                // Wait out the armed state as WaitForDomainReload.Perform
+                // does — while a script reload stays requested or a
+                // compile runs — but bounded: the reload itself kills
+                // the domain mid-wait, so a deadline expiry can only
+                // mean the proven pending state never crossed.
+                while (ReloadPending())
+                {
+                    if (EditorApplication.timeSinceStartup >= deadline)
+                    {
+                        EditorApplication.LockReloadAssemblies();
+                        Assert.Fail(
+                            "OperationIdentityTests." + m_phase +
+                            " timed out after " + m_timeoutSec +
+                            " s: the proven pending reload never crossed");
+                    }
+                    yield return null;
+                }
+
+                if (EditorUtility.scriptCompilationFailed)
+                {
+                    EditorApplication.LockReloadAssemblies();
+                    Assert.Fail(
+                        "OperationIdentityTests." + m_phase +
+                        ": script compilation failed");
+                }
+            }
         }
 
         // Reads the static s_ctorCalls probe of a fixture class discovered

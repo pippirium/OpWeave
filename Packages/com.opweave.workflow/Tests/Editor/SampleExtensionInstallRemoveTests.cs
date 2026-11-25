@@ -481,13 +481,122 @@ namespace OpWeave.UnityAdapter.Tests
                 what + " failed: " + detail);
         }
 
+        // The pending proof WaitForDomainReload needs before it is
+        // yielded: its Perform throws the moment neither flag is set, so
+        // the instruction may only be armed once a reload is provably
+        // queued — a requested script reload, or an in-flight compile
+        // that ends in one. The wait only waits — it never throws and
+        // never yields an edit-mode yield instruction, which a nested
+        // enumerator is not allowed to yield; the caller checks
+        // ReloadPending() afterwards so teardown can record a timeout
+        // and still drain the reloads the failure left queued.
+        private static IEnumerator WaitForReloadPending()
+        {
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            while (!ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+        }
+
+        private static string ReloadTimeoutMessage(string what) =>
+            "no domain reload became pending within " + WaitTimeoutSec +
+            " s of " + what;
+
+        // The per-Editor-session resume-owner record behind each body
+        // boundary: ArmReloadBoundary writes the reload-counter
+        // baseline AND "test|boundary" — SessionState survives the
+        // reload, so a continuation UTF resumes on a stale enumerator
+        // position — one that never ran the arming segment — finds the
+        // previous test's mark or none and AssertReloadCrossed fails
+        // closed instead of silently continuing into the post-reload
+        // phase.
+        private const string BoundaryOwnerSessionKey =
+            "OpWeave.SampleE2E.boundary-owner";
+
+        private static string CurrentTestFullName =>
+            TestContext.CurrentContext.Test.FullName ??
+            TestContext.CurrentContext.Test.Name ?? "unknown";
+
+        private static void ArmBoundary(string boundaryId) =>
+            SessionState.SetString(
+                BoundaryOwnerSessionKey,
+                CurrentTestFullName + "|" + boundaryId);
+
+        private static void AssertBoundaryOwned(string boundaryId)
+        {
+            var owner = SessionState.GetString(BoundaryOwnerSessionKey, "");
+            Assert.That(
+                owner,
+                Is.EqualTo(CurrentTestFullName + "|" + boundaryId),
+                "the \"" + boundaryId + "\" reload boundary was not armed by " +
+                "this test in this Editor session (armed: \"" + owner +
+                "\") — the continuation resumed on a stale position");
+        }
+
+        // The one sanctioned pre-boundary arm: the reload-counter
+        // baseline plus the owner record, both in SessionState — a
+        // stale-resume continuation that skipped this statement fails
+        // AssertReloadCrossed's owner check even when the counter
+        // comparison alone would pass on an older baseline.
+        private static void ArmReloadBoundary(string what)
+        {
+            SessionState.SetInt(
+                ReloadBaselineKey, DomainReloadCounter.Current);
+            ArmBoundary(what);
+        }
+
         private static void AssertReloadCrossed(string what)
         {
             var baseline = SessionState.GetInt(ReloadBaselineKey, -1);
             Assert.That(DomainReloadCounter.Current,
                 Is.GreaterThan(baseline),
                 what + " did not cross a domain reload");
+            AssertBoundaryOwned(what);
         }
+
+        // The same pending-request flag WaitForDomainReload.Perform
+        // polls — Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the wait
+        // reaches it through reflection. A reload already armed behind
+        // the runner's reload lock surfaces here while isCompiling is
+        // false, which is exactly the deferred state the quiet window
+        // missed. The probe is resolved deterministically from the
+        // UnityEditor assembly and its shape is proven once at fixture
+        // start: a Unity version without it fails the fixture outright —
+        // there is no isCompiling-only fallback.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly System.Reflection.MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    System.Reflection.BindingFlags.Static |
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
 
         // ---------- sample fixture helpers ----------
 
@@ -543,6 +652,30 @@ namespace OpWeave.UnityAdapter.Tests
 
         // ---------- suite setup / teardown ----------
 
+        // The pending-reload proof every wait below arms on is only as
+        // strong as the probe it polls: if this Unity version does not
+        // carry it, the fixture fails here — before any install —
+        // instead of silently degrading to an isCompiling-only check
+        // that re-opens the missed-request race the probe exists to
+        // close.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "Unity " + Application.unityVersion + ": " +
+                    ScriptReloadProbeType + "." + ScriptReloadProbeMethod +
+                    " in the UnityEditor assembly must be a static, " +
+                    "parameterless method returning bool");
+            }
+        }
+
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
@@ -586,7 +719,25 @@ namespace OpWeave.UnityAdapter.Tests
                 // shed, never pass over.
                 RestoreOriginalSync();
                 AssetDatabase.Refresh();
+                yield return WaitForReloadPending();
+                Assert.That(ReloadPending(), Is.True,
+                    ReloadTimeoutMessage("the manifest/lock restore"));
                 yield return new WaitForDomainReload();
+            }
+            // A reload the restore left queued still fires on the next
+            // reload-lock release — drain it from this method's own
+            // enumerator (a nested enumerator may not yield
+            // WaitForDomainReload) so the test body starts on a settled
+            // domain and the reload it crosses is provably the
+            // install's own compile.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
             }
             Assert.That(ProjectMatchesOriginal(), Is.True,
                 "the project did not settle on its captured " +
@@ -640,12 +791,42 @@ namespace OpWeave.UnityAdapter.Tests
             // domain reload the removal forces — cross it whenever the
             // assembly is still loaded so the fixture never poisons
             // the next setup with a leftover.
+            string? pendingFailure = null;
             if (!ProjectMatchesOriginal() || !SampleFullyRemoved())
             {
                 RestoreOriginalSync();
                 AssetDatabase.Refresh();
-                yield return new WaitForDomainReload();
+                yield return WaitForReloadPending();
+                if (ReloadPending())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                else
+                {
+                    pendingFailure = ReloadTimeoutMessage(
+                        "the manifest/lock restore");
+                }
             }
+            // A reload the install or the restore left queued still
+            // fires on the next reload-lock release — cross each one
+            // here so the next test's setup meets a settled domain. The
+            // WaitForDomainReload sits in this method's own enumerator:
+            // the Unity Test Framework rejects it from a nested
+            // enumerator. The loop also runs on the failure paths above
+            // — a settle or restore failure is recorded and re-reported
+            // only after the queue is drained, so a failure cannot
+            // leave the sample assembly loaded for the next test
+            // without a clear failure of its own.
+            while (ReloadPending() &&
+                   EditorApplication.timeSinceStartup < deadline)
+            {
+                if (ScriptReloadRequested())
+                {
+                    yield return new WaitForDomainReload();
+                }
+                yield return null;
+            }
+            Assert.That(pendingFailure, Is.Null, pendingFailure!);
             Assert.That(ProjectMatchesOriginal(), Is.True,
                 "the project was not restored to its captured " +
                 "manifest/lock state after the sample package probe");
@@ -676,6 +857,7 @@ namespace OpWeave.UnityAdapter.Tests
             SessionState.EraseString(PlanHashKey);
             SessionState.EraseString(TreeDigestKey);
             SessionState.EraseInt(ReloadBaselineKey);
+            SessionState.EraseString(BoundaryOwnerSessionKey);
         }
 
         // ---------- §X.4 install + atomic registration ----------
@@ -709,8 +891,10 @@ namespace OpWeave.UnityAdapter.Tests
             // reload provably armed before the sanctioned crossing.
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample install"));
+            ArmReloadBoundary("the sample install");
             yield return new WaitForDomainReload();
 
             // Phase 2 (post-reload domain): prove the crossing, then
@@ -815,8 +999,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample install"));
+            ArmReloadBoundary("the sample install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the sample install");
@@ -870,8 +1056,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample install"));
+            ArmReloadBoundary("the sample install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the sample install");
@@ -1024,8 +1212,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the revision-A install"));
+            ArmReloadBoundary("the revision-A install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the revision-A install");
@@ -1073,8 +1263,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the revision-B switch"));
+            ArmReloadBoundary("the revision-B switch");
             yield return new WaitForDomainReload();
 
             // Phase 3 (post-reload domain): the Registry rebuilt over
@@ -1174,8 +1366,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample install"));
+            ArmReloadBoundary("the sample install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the sample install");
@@ -1364,8 +1558,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample install"));
+            ArmReloadBoundary("the sample install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the sample install");
@@ -1390,8 +1586,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample removal"));
+            ArmReloadBoundary("the sample removal");
             yield return new WaitForDomainReload();
 
             // Phase 3 (post-removal domain): everything that came from
@@ -1483,8 +1681,10 @@ namespace OpWeave.UnityAdapter.Tests
 
             AssetDatabase.Refresh();
             yield return QuietSettle();
-            SessionState.SetInt(
-                ReloadBaselineKey, DomainReloadCounter.Current);
+            yield return WaitForReloadPending();
+            Assert.That(ReloadPending(), Is.True,
+                ReloadTimeoutMessage("the sample re-install"));
+            ArmReloadBoundary("the sample re-install");
             yield return new WaitForDomainReload();
 
             AssertReloadCrossed("the sample re-install");

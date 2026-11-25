@@ -907,7 +907,26 @@ namespace OpWeave.UnityAdapter
         {
             if (change.State is RunState.Succeeded or RunState.Failed or RunState.Cancelled)
             {
-                RunLockHandoff.Clear(_runStoreRoot);
+                // The terminal event alone is not the emptying and release the
+                // comment above names: EndRun publishes it only after a
+                // successful CoordinatorRunLock.Release, but the SPEC §F1
+                // store-failure end (EndStoreFailedRun) and the
+                // terminal-pending-release convergence (ConvergeToJournaledEnd)
+                // publish it while the Run's HeldLock still holds the OS
+                // exclusion — the deferred ReleaseEndedRunLocks retry that
+                // later drops it publishes no event — and an inactive Run's
+                // terminal record can arrive while another Run still holds.
+                // Clearing then would erase the only record of a live handle:
+                // the orphaned exclusion §E2 item 3 (a) exists to survive.
+                // The record is therefore spent only once no tracked Run
+                // holds the exclusion — the same proof the recovery pass's own
+                // guard requires. A record a deferred release leaves behind
+                // is residue TryAdopt fails closed on; the next RecoverRuns
+                // drops it through the same check.
+                if (!_coordinator.HoldsAnyRunLock())
+                {
+                    RunLockHandoff.Clear(_runStoreRoot);
+                }
                 return;
             }
             if (_coordinator.HoldsRunLock(change.RunId))

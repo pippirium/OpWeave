@@ -31,6 +31,12 @@
 // failures — including an unexpected exception such as the NRE this
 // restructure replaces — surface as the ProbePhaseResult failure text
 // instead of a bare stackless fault.
+//
+// T-W2.4-10: held.txt carries a per-Editor-session nonce mirrored in
+// SessionState, setup and teardown never yield a reload emitter (the
+// queued cleanup compile drains at the test body's own boundary), and
+// the boundary loop re-drives a phase-1 a stale resume skipped — the
+// ChangeSetDomainReloadTests shape.
 using System;
 using System.Collections;
 using System.Diagnostics;
@@ -165,6 +171,48 @@ namespace OpWeave.UnityAdapter.Tests
         private static void ArmDomainSentinel() => s_domainSentinel = new object();
         private static bool DomainSentinelAlive => s_domainSentinel is not null;
 
+        // A per-Editor-session token phase-1 stores in SessionState and
+        // writes as held.txt's last line; phase-2 reads both to prove the
+        // record belongs to this session's phase-1 — a stale resume that
+        // skipped phase-1 (no file, no nonce), a record deleted by
+        // cleanup, and residue of an earlier session (file yes, nonce
+        // no) each fail closed, never silently.
+        private const string ProbeSessionKey = "OpWeave.LockReload.ProbeToken";
+
+        // Bound on phase-1 re-drive legs after a stale resume is
+        // detected (the T-W2.4-06 self-heal); the this-session probe
+        // check is what actually ends the loop.
+        private const int MaxReDriveLegs = 3;
+
+        private static string ArmProbeNonce()
+        {
+            var nonce = Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeSessionKey, nonce);
+            return nonce;
+        }
+
+        // The probe proves phase-1 ran in THIS Editor session: held.txt
+        // must exist AND its last line must equal the nonce phase-1
+        // stored in SessionState — both survive the reload, so a skipped
+        // phase-1 and cross-session residue both fail the check and the
+        // caller re-drives a real phase-1 instead of skipping silently
+        // into phase-2.
+        private static bool ProbeWrittenThisSession()
+        {
+            if (!File.Exists(HeldFile))
+            {
+                return false;
+            }
+            var expected = SessionState.GetString(ProbeSessionKey, "");
+            if (expected.Length == 0)
+            {
+                return false;
+            }
+            var lines = File.ReadAllLines(HeldFile);
+            return lines.Length > 0 &&
+                lines[lines.Length - 1] == expected;
+        }
+
         private static string MarkerDisk =>
             Path.Combine(ProjectRoot, MarkerFolder.Replace('/', Path.DirectorySeparatorChar));
 
@@ -281,25 +329,38 @@ namespace OpWeave.UnityAdapter.Tests
                 Directory.Delete(MarkerDisk, recursive: true);
                 dirty = true;
             }
+            if (dirty)
+            {
+                AssetDatabase.Refresh();
+            }
             return dirty;
         }
 
+        // Setup and teardown must never yield an ExpectDomainReload
+        // instruction (RecompileScripts): UTF's PrepareForDomainReload
+        // records the CURRENT TestEnumerator's program counter — still a
+        // different test's method enumerator while setup or teardown is
+        // running — and the resume then applies that stale PC to the next
+        // test method's fresh enumerator, jumping it past phase-1
+        // entirely (T-W2.4-10). The marker-folder deletion above queues
+        // its compile under the runner's LockReloadAssemblies, so the
+        // reload it needs drains at the test body's own
+        // `yield return new RecompileScripts()`, whose captured PC is the
+        // correct one.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            if (CleanupProbeArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            var dirty = CleanupProbeArtifacts();
+            Crumb("setup cleanup exit; assetsDirty=" + dirty);
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            if (CleanupProbeArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            var dirty = CleanupProbeArtifacts();
+            Crumb("teardown cleanup exit; assetsDirty=" + dirty);
+            yield break;
         }
 
         // SPEC §E2 item 3 + §T.4 L-14: the Editor process holds the lock, a
@@ -330,15 +391,45 @@ namespace OpWeave.UnityAdapter.Tests
                 "pre-reload phase failed: " + phase1.Failure);
             Crumb("phase-1 passed; yielding RecompileScripts");
 
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+            // T-W2.4-06 stale-resume self-heal: a predecessor's captured
+            // UTF resume PC applies to this fresh enumerator and lands it
+            // at a post-yield state inside this loop — with every local
+            // (leg included) reset to default. Each leg drains, then MUST
+            // pass the this-session probe check: a held.txt phase-1 never
+            // wrote re-drives a real phase-1 + compile + reload instead
+            // of skipping silently into phase-2. After the bound the loop
+            // exits and phase-2's never-executed diagnostic fails loudly.
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                var deadline = EditorApplication.timeSinceStartup + 120.0;
+                while (DomainSentinelAlive && guard++ < 10000 &&
+                    EditorApplication.timeSinceStartup < deadline)
+                {
+                    yield return null;
+                }
+                Crumb("iterator resumed; domain sentinel alive=" +
+                    DomainSentinelAlive + " leg=" + leg);
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the probe compile did not produce a domain reload");
+
+                if (ProbeWrittenThisSession() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // CleanupProbeArtifacts adopts and disposes the leftover
+                // exclusion from held.txt and deletes the probe assets,
+                // so the re-write queues a real compile and the re-drive
+                // re-takes the lock on a clean root.
+                CleanupProbeArtifacts();
+                var redrive = RunPhaseBeforeReload();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " ok=" + redrive.Ok +
+                    " failure=" + redrive.Failure);
+                Assert.That(redrive.Ok, Is.True,
+                    "re-driven pre-reload phase failed: " + redrive.Failure);
             }
-            Crumb("iterator resumed; domain sentinel alive=" + DomainSentinelAlive);
-            Assert.IsFalse(DomainSentinelAlive,
-                "the probe compile did not produce a domain reload");
 
             var phase2 = RunPhaseAfterReload();
             Crumb("phase-2 returned ok=" + phase2.Ok + " failure=" + phase2.Failure);
@@ -424,7 +515,7 @@ namespace OpWeave.UnityAdapter.Tests
                 // no longer lose persisted state.
                 File.WriteAllText(HeldFile,
                     held.LockHandleValue.ToInt64() + "\n" + LockRoot + "\n" +
-                    runId + "\n" + sessionId);
+                    runId + "\n" + sessionId + "\n" + ArmProbeNonce());
                 Crumb("phase-1 persisted " + HeldFile);
 
                 // The marker script makes the pending recompile genuine and
@@ -463,19 +554,33 @@ namespace OpWeave.UnityAdapter.Tests
                         "the L-14 observation needs a host python (python3/python/py) after the domain reload");
                 }
 
+                var expectedToken = SessionState.GetString(ProbeSessionKey, "");
                 Crumb("phase-2 held.txt exists=" + File.Exists(HeldFile) + " path=" + HeldFile);
                 if (!File.Exists(HeldFile))
                 {
                     return ProbePhaseResult.Fail(
-                        "the persisted lock record did not survive the domain reload");
+                        expectedToken.Length == 0
+                            ? "phase-1 never executed in this Editor session (" +
+                                HeldFile + " was never written; probeDir exists=" +
+                                Directory.Exists(ProbeDir) + ")"
+                            : "the persisted lock record " + HeldFile +
+                                " was deleted after phase-1 wrote it");
                 }
                 var persisted = File.ReadAllLines(HeldFile);
                 Crumb("phase-2 held.txt lines=" + persisted.Length);
-                if (persisted.Length < 4)
+                if (persisted.Length < 5)
                 {
                     return ProbePhaseResult.Fail(
                         "the persisted lock record is incomplete after the reload: " +
                         persisted.Length + " line(s)");
+                }
+                if (expectedToken.Length == 0 ||
+                    persisted[persisted.Length - 1] != expectedToken)
+                {
+                    return ProbePhaseResult.Fail(
+                        "the persisted lock record is stale — a previous " +
+                        "Editor session or an abandoned leg wrote " +
+                        HeldFile + "; refusing to adopt its handle");
                 }
                 if (!long.TryParse(persisted[0], out var handleValue))
                 {

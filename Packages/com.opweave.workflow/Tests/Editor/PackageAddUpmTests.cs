@@ -467,6 +467,7 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 ["snapshot"] = snapshot.ToToken(),
                 ["reloads"] = DomainReloadCounter.Current,
+                ["session"] = ArmProbeNonce(),
             };
             if (tokenJson is not null)
             {
@@ -597,6 +598,75 @@ namespace OpWeave.UnityAdapter.Tests
             " s of the package install (fixture assembly " +
             FixtureAssemblyName + " already loaded: " +
             AssemblyLoaded(FixtureAssemblyName) + ")";
+
+        // The per-Editor-session resume-owner record behind each body
+        // boundary: armed only by this test's own pre-boundary statement
+        // and SessionState-mirrored across the reload, so a continuation
+        // UTF resumes on a stale enumerator position — one that never
+        // ran the arming segment — finds the previous test's mark or
+        // none and fails the boundary check closed instead of silently
+        // continuing into the post-reload phase.
+        private const string BoundaryOwnerSessionKey =
+            "OpWeave.PackageAdd.boundary-owner";
+
+        private static string CurrentTestFullName =>
+            TestContext.CurrentContext.Test.FullName ??
+            TestContext.CurrentContext.Test.Name ?? "unknown";
+
+        private static void ArmBoundary(string boundaryId) =>
+            SessionState.SetString(
+                BoundaryOwnerSessionKey,
+                CurrentTestFullName + "|" + boundaryId);
+
+        private static void AssertBoundaryOwned(string boundaryId)
+        {
+            var owner = SessionState.GetString(BoundaryOwnerSessionKey, "");
+            Assert.That(
+                owner,
+                Is.EqualTo(CurrentTestFullName + "|" + boundaryId),
+                "the \"" + boundaryId + "\" reload boundary was not armed by " +
+                "this test in this Editor session (armed: \"" + owner +
+                "\") — the continuation resumed on a stale position");
+        }
+
+        // The persisted evidence's session identity: PersistState writes
+        // the nonce into the file's "session" member AND SessionState —
+        // both survive the reload, so post-reload phases prove the file
+        // belongs to this session's arm (a stale resume that skipped it,
+        // a deleted file, or cross-session residue each fail closed).
+        private const string ProbeSessionKey =
+            "OpWeave.PackageAdd.state-session";
+
+        private static string ArmProbeNonce()
+        {
+            var nonce = Guid.NewGuid().ToString("N");
+            SessionState.SetString(ProbeSessionKey, nonce);
+            return nonce;
+        }
+
+        private static void AssertLiveSession(string what)
+        {
+            var expected = SessionState.GetString(ProbeSessionKey, "");
+            if (!File.Exists(StatePath))
+            {
+                Assert.Fail(
+                    expected.Length == 0
+                        ? what + " never persisted in this Editor session (" +
+                            StatePath + " is absent)"
+                        : what + " " + StatePath +
+                            " was deleted after it was written");
+                return;
+            }
+            var session =
+                (string?)JObject.Parse(File.ReadAllText(StatePath))["session"];
+            if (expected.Length == 0 || session != expected)
+            {
+                Assert.Fail(
+                    what + " is stale — a previous Editor session or an " +
+                    "abandoned leg wrote " + StatePath +
+                    "; refusing to trust it");
+            }
+        }
 
         // ---------- setUp / tearDown ----------
 
@@ -841,7 +911,9 @@ namespace OpWeave.UnityAdapter.Tests
                 "the fixture package never registered with UPM after the manifest install");
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True, ReloadTimeoutMessage());
+            ArmBoundary("install");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
 
             // Phase 2 (post-reload): the snapshot comes back off its
             // persisted text alone — no in-memory state survived
@@ -850,6 +922,7 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 Assert.Fail("the persisted evidence state is missing after the reload");
             }
+            AssertLiveSession("the persisted evidence state");
             Assert.That(DomainReloadCounter.Current, Is.GreaterThan(baseline),
                 "the package install did not cross a domain reload");
 
@@ -900,12 +973,15 @@ namespace OpWeave.UnityAdapter.Tests
                 "the fixture package never registered with UPM after the manifest install");
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True, ReloadTimeoutMessage());
+            ArmBoundary("install");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
 
             if (!TryReadState(out var reloaded, out var baseline, out _))
             {
                 Assert.Fail("the persisted evidence state is missing after the reload");
             }
+            AssertLiveSession("the persisted evidence state");
             Assert.That(DomainReloadCounter.Current, Is.GreaterThan(baseline),
                 "the package install did not cross a domain reload");
 
@@ -955,12 +1031,15 @@ namespace OpWeave.UnityAdapter.Tests
                 "the fixture package never registered with UPM after the manifest install");
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True, ReloadTimeoutMessage());
+            ArmBoundary("install");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
 
             if (!TryReadState(out var reloaded, out var baseline, out _))
             {
                 Assert.Fail("the persisted evidence state is missing after the reload");
             }
+            AssertLiveSession("the persisted evidence state");
             Assert.That(DomainReloadCounter.Current, Is.GreaterThan(baseline),
                 "the package install did not cross a domain reload");
 
@@ -1008,7 +1087,9 @@ namespace OpWeave.UnityAdapter.Tests
                 "the registry package never resolved after Client.Add");
             yield return WaitForReloadPending();
             Assert.That(ReloadPending(), Is.True, ReloadTimeoutMessage());
+            ArmBoundary("install");
             yield return new WaitForDomainReload();
+            AssertBoundaryOwned("install");
 
             // Phase 2 (post-reload): the operation is a fresh instance
             // and the token reloads from its persisted text — the only
@@ -1017,6 +1098,7 @@ namespace OpWeave.UnityAdapter.Tests
             {
                 Assert.Fail("the persisted evidence state is missing after the reload");
             }
+            AssertLiveSession("the persisted evidence state");
             Assert.That(DomainReloadCounter.Current, Is.GreaterThan(baseline),
                 "the package install did not cross a domain reload");
             Assert.That(resumed, Is.Not.Null, "no persisted resume token");

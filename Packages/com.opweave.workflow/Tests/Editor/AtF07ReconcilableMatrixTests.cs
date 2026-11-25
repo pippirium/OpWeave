@@ -66,7 +66,7 @@ namespace OpWeave.UnityAdapter.Tests
             PrefabContentsFixture.UnloadAllOpenedContents();
             AtF07Matrix.EnsureBaseScene();
             foreach (var go in UnityEngine.Object.FindObjectsByType<GameObject>(
-                    FindObjectsInactive.Include))
+                    FindObjectsInactive.Include, FindObjectsSortMode.None))
             {
                 if (go.name.StartsWith("Atf07M", StringComparison.Ordinal))
                 {
@@ -77,6 +77,13 @@ namespace OpWeave.UnityAdapter.Tests
             if (AssetDatabase.IsValidFolder(folder))
             {
                 AssetDatabase.DeleteAsset(folder);
+                // DeleteAsset only marks the removal: in batchmode the
+                // files can still be on disk until the asset pipeline
+                // settles, and a raw File.Copy (the restart fixture's
+                // project clone) would capture the ghosts as residue
+                // (T-W2.4-11). Refresh flushes the delete to disk
+                // synchronously.
+                AssetDatabase.Refresh();
             }
         }
 
@@ -325,7 +332,7 @@ namespace OpWeave.UnityAdapter.Tests
             p.ToDictionary(x => x.Item1, x => x.Item2);
         private static List<GameObject> Named(string name) =>
             UnityEngine.Object.FindObjectsByType<GameObject>(
-                    FindObjectsInactive.Include)
+                    FindObjectsInactive.Include, FindObjectsSortMode.None)
                 .Where(g => g.name == name).ToList();
 
         private static string ProbeShader() =>

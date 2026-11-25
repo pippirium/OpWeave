@@ -18,10 +18,12 @@ using System.Runtime.CompilerServices;
 // contracts only.
 [assembly: InternalsVisibleTo("OpWeave.Operations")]
 
-// The EditMode test assembly builds Core-internal fixtures (CompiledPlan, the
-// planHash input parts) to exercise that host; the public surface stays the
-// SPEC-defined one.
+// The EditMode test assemblies build Core-internal fixtures (CompiledPlan,
+// the planHash input parts, JsonSaveCoordinator intent records) to exercise
+// that host; the public surface stays the SPEC-defined one. The Graph
+// Toolkit tests live in their own 6000.5-gated assembly.
 [assembly: InternalsVisibleTo("OpWeave.UnityAdapter.Tests")]
+[assembly: InternalsVisibleTo("OpWeave.GraphToolkit.Tests")]
 
 // SPEC §H1–§H4: the Agent API's production installer binds the runner host's
 // §E8 dispatcher (RunEvents) and the §E6 cancel entry point

@@ -314,7 +314,8 @@ namespace OpWeave.UnityAdapter.Tests
                 "; fatal: " + Fatal(jobDir) + "; output: " +
                 EditorProcessHarness.ChildOutput(child));
             var text = EditorProcessHarness.WaitForFileContent(
-                Path.Combine(jobDir, "verdict.json"), 30000);
+                Path.Combine(jobDir, "verdict.json"), 30000,
+                watchedProcess: child.Process);
             Assert.IsNotNull(text,
                 "the G-06 child never wrote verdict.json; log: " + child.LogPath +
                 "; fatal: " + Fatal(jobDir));

@@ -23,6 +23,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using OpWeave.Core;
@@ -97,6 +98,66 @@ namespace OpWeave.UnityAdapter.Tests
 
         private static string DiffStoreDir => Path.Combine(TestOwnedDir, "RegistryStore");
 
+        // A per-Editor-session nonce phase-1 arms in SessionState and on
+        // disk under the test-owned Library dir (the At03NoDuplicatesTests
+        // discipline, T-W2.4-07): both survive a domain reload but die
+        // with the Editor, so a probe file whose nonce still matches the
+        // armed one is THIS session's live in-flight state a replayed
+        // setup must never reclaim — anything else is stale residue. The
+        // nonce is the session-token the stale-resume re-drive and the
+        // post-reload gate check.
+        private const string ProbeSessionKey = "OpWeave.At01Accept.probe-state";
+
+        private static string NonceFile => Path.Combine(TestOwnedDir, "probe.nonce");
+
+        // T-W2.4-07: bound on phase-1 re-drive legs after a predecessor's
+        // stale resume is detected. leg is a method local, so a real
+        // reload resets it; the live-nonce probe check is what actually
+        // ends the loop (the ChangeSetDomainReloadTests pattern).
+        private const int MaxReDriveLegs = 3;
+
+        private static void Crumb(string message) => Debug.Log("[W4507] " + message);
+
+        // The pending-request flag WaitForDomainReload.Perform polls —
+        // Unity exposes it only to its own test framework
+        // (InternalEditorUtility is an internal class), so the drain
+        // reaches it through reflection (the At01AgentStepsTests probe,
+        // T-W2.4-07). A reload already armed behind the runner's reload
+        // lock surfaces here while isCompiling is false — the deferred
+        // state an isCompiling-only check misses.
+        private const string ScriptReloadProbeType =
+            "UnityEditorInternal.InternalEditorUtility";
+        private const string ScriptReloadProbeMethod =
+            "IsScriptReloadRequested";
+
+        private static readonly MethodInfo? s_scriptReloadRequested =
+            typeof(EditorApplication).Assembly
+                .GetType(ScriptReloadProbeType)
+                ?.GetMethod(
+                    ScriptReloadProbeMethod,
+                    BindingFlags.Static | BindingFlags.Instance |
+                    BindingFlags.Public | BindingFlags.NonPublic,
+                    binder: null,
+                    types: Type.EmptyTypes,
+                    modifiers: null);
+
+        // Non-null and shaped as OneTimeSetUp proved — the fixture does
+        // not run at all on a Unity version whose probe is absent.
+        private static bool ScriptReloadRequested() =>
+            (bool)s_scriptReloadRequested!.Invoke(null, null)!;
+
+        // The state a queued compile/reload reports while the runner's
+        // lock holds it: a running script compile always ends in a
+        // reload queued behind the lock, and a requested reload is
+        // already pending — either is one the drain must cross, never
+        // forward to the next fixture whose registry-freshness checks
+        // read isCompiling directly (SPEC §C3 rule 9: a stale build).
+        private static bool ReloadPending() =>
+            ScriptReloadRequested() || EditorApplication.isCompiling;
+
+        private const double WaitTimeoutSec = 240.0;
+        private const double QuietSettleSec = 5.0;
+
         private static string CompileProbeDiskDir => Path.Combine(ProjectRoot, CompileProbeDir);
 
         // ── AT-01 step 1: the Operation lives in the project, not the package ──
@@ -143,28 +204,133 @@ namespace OpWeave.UnityAdapter.Tests
         private static void ArmDomainSentinel() => s_domainSentinel = new object();
         private static bool DomainSentinelAlive => s_domainSentinel is not null;
 
+        // The pending probe the drain trusts is only as strong as its
+        // shape: prove it once up front (the At01AgentStepsTests pattern,
+        // T-W2.4-07) so the fixture fails here — before any test —
+        // instead of silently degrading to an isCompiling-only check
+        // that misses a requested reload armed behind the lock.
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            var probe = s_scriptReloadRequested;
+            if (probe is null ||
+                !probe.IsStatic ||
+                probe.GetParameters().Length != 0 ||
+                probe.ReturnType != typeof(bool))
+            {
+                Assert.Fail(
+                    "the domain-reload pending probe is unavailable on " +
+                    "this Unity version — the teardown cannot prove a " +
+                    "deferred reload is drained");
+            }
+        }
+
+        // UTF replays the before/after commands from their first
+        // statement on every domain a [UnityTest] crosses, so the probe
+        // nonce gates the setup: a replay around the in-flight test
+        // restores nothing and deletes nothing (the At03NoDuplicatesTests
+        // discipline). What the commands may NEVER yield is an
+        // unconditional emitter — a bare `yield return new
+        // RecompileScripts(false)` whose ExpectDomainReload=false keeps
+        // UTF from recording any resume state, so a real reload crossing
+        // the unlock abandons the test on cleared locals (the stale-PC
+        // silent-PASS vector, T-W2.4-07). The compile the probe-folder
+        // deletion queues is instead drained at this command's own
+        // bounded conditional drain — DrainedScriptReload, yielded only
+        // after ReloadPending() proves a reload is armed, with UTF's
+        // resume bookkeeping armed and the drain rebuilt on resume —
+        // so a [Test] body like Steps6To9 finds a drained editor: its
+        // RegistryBuildHost.Rebuild would read isCompiling true and
+        // mark the build stale (SPEC §C3 rule 9) over a pending compile
+        // nobody drained.
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            var dirty = Cleanup();
-            if (dirty)
+            if (ProbeStateIsLive())
             {
-                yield return new RecompileScripts(false);
+                Crumb("setup replayed around the in-flight test — " +
+                    "the live probe state is left untouched");
+                yield break;
+            }
+            Cleanup();
+            // UTF resumes a reload-crossed setup enumerator at its yield
+            // with every local reset — a null drain is that resume, not
+            // a fresh start: rebuild the idempotent drain and relay on
+            // instead of touching the dead reference.
+            IEnumerator? drain = null;
+            for (;;)
+            {
+                drain ??= DrainEditorState(nameof(UnitySetUp));
+                if (!drain.MoveNext())
+                {
+                    break;
+                }
+                yield return drain.Current;
             }
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
-            var dirty = Cleanup();
-            if (dirty)
+            // The test is over — drop the live-state nonce so the cleanup
+            // below really does reclaim the probe state.
+            DisarmProbeNonce();
+            Cleanup();
+            // The teardown owns the deferred reload its probe-folder
+            // delete queues: left pending, it rides into the next fixture
+            // whose registry freshness asserts do not expect one — it
+            // crosses at this command's own bounded drain
+            // (proven-pending only), whose resume rebuilds the drain
+            // rather than touching a dead reference.
+            IEnumerator? drain = null;
+            for (;;)
             {
-                yield return new RecompileScripts(false);
+                drain ??= DrainEditorState(nameof(UnityTearDown));
+                if (!drain.MoveNext())
+                {
+                    break;
+                }
+                yield return drain.Current;
             }
         }
 
+        // The session-token pair the nonce proves: the file under the
+        // test-owned Library dir carries the nonce the compile-probe
+        // phase armed in SessionState, and both die together on any
+        // cleanup that legitimately reclaims the dir — a file without
+        // the armed session's nonce is residue of an earlier Editor
+        // session, never this run's phase-1.
+        private static string ArmProbeNonce()
+        {
+            var nonce = Guid.NewGuid().ToString("N");
+            Directory.CreateDirectory(TestOwnedDir);
+            File.WriteAllText(NonceFile, nonce + "\n");
+            SessionState.SetString(ProbeSessionKey, nonce);
+            return nonce;
+        }
+
+        private static void DisarmProbeNonce() =>
+            SessionState.EraseString(ProbeSessionKey);
+
+        private static bool ProbeStateIsLive()
+        {
+            var nonce = SessionState.GetString(ProbeSessionKey, "");
+            return nonce.Length > 0 && File.Exists(NonceFile) &&
+                string.Equals(
+                    File.ReadAllText(NonceFile).Trim(), nonce,
+                    StringComparison.Ordinal);
+        }
+
+        // The probe-state cleanup — safe inside UnitySetUp and
+        // UnityTearDown, which must never schedule a reload. A replayed
+        // command around a live test leaves the probe state untouched:
+        // only a dir whose nonce is not the armed one is stale residue.
         private static bool Cleanup()
         {
+            if (ProbeStateIsLive())
+            {
+                return false;
+            }
             var dirty = false;
             if (Directory.Exists(TestOwnedDir))
             {
@@ -183,25 +349,218 @@ namespace OpWeave.UnityAdapter.Tests
             return dirty;
         }
 
+        // The sanctioned setup/teardown drain (the At01AgentStepsTests
+        // idiom, T-W2.4-07): a queued compile surfaces as isCompiling a
+        // frame or two after Refresh returns, so the wait only trusts a
+        // sustained quiet spell (the QuietSettleSec convention) — quiet
+        // flags reset on every busy frame and a periodic Refresh flushes
+        // the import queue so a queued compile surfaces inside the
+        // window, never behind it. A pending compile or requested reload
+        // is crossed only at DrainedScriptReload — the bounded
+        // instruction that unlocks once the pending state is proven;
+        // never an unconditional RecompileScripts(false) unlock, which
+        // releases the runner's reload lock even when nothing is queued
+        // and arms UTF's resume bookkeeping with a stale program counter.
+        // The instruction the nested enumerator produces is yielded
+        // DIRECTLY from the caller's own top level through its MoveNext
+        // relay — a nested yield would never reach Perform — and the
+        // whole sequence is idempotent: a crossed reload resumes the
+        // caller's enumerator at its yield with every local reset (or
+        // replays the command), so the caller rebuilds the drain when it
+        // arrives null rather than relaying a dead reference.
+        private static IEnumerator DrainEditorState(string phase)
+        {
+            AssetDatabase.Refresh();
+            var deadline = EditorApplication.timeSinceStartup + WaitTimeoutSec;
+            var nextRefreshAt = double.NegativeInfinity;
+            var quietAt = -1.0;
+            for (;;)
+            {
+                if (EditorApplication.timeSinceStartup >= deadline)
+                {
+                    Assert.Fail(
+                        "At01CustomOperationAcceptanceTests." + phase +
+                        " timed out after " + WaitTimeoutSec +
+                        " s draining the armed editor state " +
+                        "(scriptReloadRequested: " + ScriptReloadRequested() +
+                        ", isCompiling: " + EditorApplication.isCompiling +
+                        ", isUpdating: " + EditorApplication.isUpdating + ")");
+                }
+                if (ReloadPending())
+                {
+                    // A running or requested compile ends in a reload
+                    // queued behind the runner's lock — cross it at the
+                    // bounded sanctioned boundary, never hand it on.
+                    quietAt = -1.0;
+                    yield return new DrainedScriptReload(
+                        phase, WaitTimeoutSec);
+                    continue;
+                }
+                if (EditorApplication.isUpdating)
+                {
+                    // An import still in flight may surface a compile —
+                    // no quiet counts while it runs.
+                    quietAt = -1.0;
+                }
+                else if (quietAt < 0.0)
+                {
+                    quietAt = EditorApplication.timeSinceStartup;
+                }
+                else if (EditorApplication.timeSinceStartup - quietAt >=
+                         QuietSettleSec)
+                {
+                    break;
+                }
+                if (EditorApplication.timeSinceStartup >= nextRefreshAt)
+                {
+                    AssetDatabase.Refresh();
+                    nextRefreshAt = EditorApplication.timeSinceStartup + 1.0;
+                }
+                yield return null;
+            }
+            AssertDrainedEditorState(phase);
+        }
+
+        // The terminal clean-state proof: the project compiled clean, no
+        // compile in flight and no script reload still armed behind the
+        // runner's lock — a leftover here is this fixture's failure,
+        // never a later suite index's.
+        private static void AssertDrainedEditorState(string phase)
+        {
+            Assert.IsFalse(EditorUtility.scriptCompilationFailed,
+                "At01CustomOperationAcceptanceTests." + phase +
+                ": the project did not compile clean");
+            Assert.IsFalse(EditorApplication.isCompiling,
+                "At01CustomOperationAcceptanceTests." + phase +
+                ": a script compile is still running");
+            Assert.IsFalse(ScriptReloadRequested(),
+                "At01CustomOperationAcceptanceTests." + phase +
+                ": a script reload is still pending");
+        }
+
+        // The bounded reload-crossing instruction — the
+        // WaitForDomainReload.Perform wait with a deadline, run by UTF
+        // through the IEditModeTestYieldInstruction interface so
+        // ExpectDomainReload arms the runner's reload bookkeeping
+        // exactly as with UTF's own instructions. It is yielded only
+        // after ReloadPending() proved a real reload is armed, so the
+        // unlock below always meets a queued reload and can never strand
+        // the lock released on an idle Editor — the failure mode of the
+        // unconditional RecompileScripts(false) unlock it replaces. The
+        // one path where no reload can follow — a failed compile —
+        // re-locks before failing.
+        private sealed class DrainedScriptReload : IEditModeTestYieldInstruction
+        {
+            private readonly string m_phase;
+            private readonly double m_timeoutSec;
+
+            internal DrainedScriptReload(string phase, double timeoutSec)
+            {
+                m_phase = phase;
+                m_timeoutSec = timeoutSec;
+            }
+
+            public bool ExpectDomainReload => true;
+            public bool ExpectedPlaymodeState => false;
+
+            public IEnumerator Perform()
+            {
+                // UTF yields the same first frame: the runner must see
+                // the yielded instruction and arm its expected-domain-
+                // reload bookkeeping before the reload can start.
+                yield return null;
+
+                var deadline =
+                    EditorApplication.timeSinceStartup + m_timeoutSec;
+
+                AssetDatabase.Refresh();
+                EditorApplication.UnlockReloadAssemblies();
+
+                // Wait out the armed state as WaitForDomainReload.Perform
+                // does — while a script reload stays requested or a
+                // compile runs — but bounded: the reload itself kills
+                // the domain mid-wait, so a deadline expiry can only
+                // mean the proven pending state never crossed.
+                while (ReloadPending())
+                {
+                    if (EditorApplication.timeSinceStartup >= deadline)
+                    {
+                        EditorApplication.LockReloadAssemblies();
+                        Assert.Fail(
+                            "At01CustomOperationAcceptanceTests." + m_phase +
+                            " timed out after " + m_timeoutSec +
+                            " s: the proven pending reload never crossed");
+                    }
+                    yield return null;
+                }
+
+                if (EditorUtility.scriptCompilationFailed)
+                {
+                    EditorApplication.LockReloadAssemblies();
+                    Assert.Fail(
+                        "At01CustomOperationAcceptanceTests." + m_phase +
+                        ": script compilation failed");
+                }
+            }
+        }
+
         [UnityTest]
         [Timeout(300000)]
         public IEnumerator Steps2And3_Compile_ThenRegistryDiffShowsAddedCustom()
         {
             // A real source addition drives the recompile the step-2 pass
-            // condition measures (an untouched project compiles nothing).
+            // condition measures (an untouched project compiles nothing);
+            // the nonce arms THIS session's probe identity the
+            // stale-resume re-drive and the post-reload gate check.
+            ArmProbeNonce();
             Directory.CreateDirectory(CompileProbeDiskDir);
             File.WriteAllText(
                 Path.Combine(CompileProbeDiskDir, "CompileProbe.cs"), CompileProbeSource);
             AssetDatabase.Refresh();
             ArmDomainSentinel();
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+
+            // T-W2.4-07 stale-resume self-heal: a predecessor's captured
+            // UTF resume PC applies to this fresh enumerator and lands it
+            // at one of the two post-yield states inside this loop — with
+            // every local (leg included) reset to default. Both
+            // continuations drain, then MUST pass the this-session probe
+            // check: a probe phase-1 never wrote re-drives the probe
+            // write + compile + reload instead of skipping silently into
+            // the registry-diff assertions. If the probe still cannot be
+            // produced after the bound, the loop exits and the live-nonce
+            // gate below fails loudly (the ChangeSetDomainReloadTests
+            // pattern).
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (DomainSentinelAlive && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the probe compile did not produce a domain reload");
+
+                if (ProbeStateIsLive() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // Deleting the compiled probe guarantees the re-write
+                // queues a real compile rather than a no-op Refresh.
+                Cleanup();
+                ArmProbeNonce();
+                Directory.CreateDirectory(CompileProbeDiskDir);
+                File.WriteAllText(
+                    Path.Combine(CompileProbeDiskDir, "CompileProbe.cs"),
+                    CompileProbeSource);
+                AssetDatabase.Refresh();
+                ArmDomainSentinel();
             }
-            Assert.IsFalse(DomainSentinelAlive,
-                "the probe compile did not produce a domain reload");
+            Assert.IsTrue(
+                ProbeStateIsLive(),
+                "the phase-1 probe nonce is not this Editor session's — " +
+                "a skipped phase-1 must fail closed, never pass silently");
 
             // Step 2: the project — the probe and the AT-01 Operation alike —
             // compiled clean.

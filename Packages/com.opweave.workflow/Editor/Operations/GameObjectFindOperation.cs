@@ -78,7 +78,9 @@ namespace OpWeave.Operations
                     Array.Empty<PlannedChange>(),
                     JsonValue.From(new JObject()));
             }
-            if (ctx.IsPresent(ScenePort))
+            // A pending scene is edge-fed: Preflight cannot resolve it
+            // until the producing step runs (SPEC §D8).
+            if (ctx.IsPresent(ScenePort) && !ctx.IsPending(ScenePort))
             {
                 try
                 {

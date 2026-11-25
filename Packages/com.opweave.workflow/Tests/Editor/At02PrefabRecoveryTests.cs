@@ -82,6 +82,18 @@ namespace OpWeave.UnityAdapter.Tests
         private static string StoreRoot => Path.Combine(ProbeDir, "run-root");
         private static string StateFile => Path.Combine(ProbeDir, "state.txt");
 
+        // A per-Editor-session nonce the phase-1 state write arms in
+        // SessionState and on disk (the At03NoDuplicatesTests discipline,
+        // T-W2.4-07): SessionState and the Library file both survive a
+        // domain reload but die with the Editor, so a probe root whose
+        // nonce still matches the armed one is THIS session's live
+        // in-flight state a replayed setup must never reclaim — anything
+        // else is stale residue. The nonce is the session-token the
+        // phase-2 state read and the stale-resume re-drive gate on.
+        private const string ProbeSessionKey = "OpWeave.At02Prefab.probe-state";
+
+        private static string NonceFile => Path.Combine(ProbeDir, "probe.nonce");
+
         // The reload group's per-Operation Run Store: six started-only Runs
         // unfinished at once need a store each — SPEC §E2 admits at most
         // one mutating Run per store, so a second accept on one coordinator
@@ -141,6 +153,12 @@ namespace OpWeave.UnityAdapter.Tests
         private static void ArmDomainSentinel() => s_domainSentinel = new object();
         private static bool DomainSentinelAlive => s_domainSentinel is not null;
 
+        // T-W2.4-07: bound on phase-1 re-drive legs after a predecessor's
+        // stale resume is detected. leg is a method local, so a real
+        // reload resets it; the live-nonce probe check is what actually
+        // ends the loop (the ChangeSetDomainReloadTests pattern).
+        private const int MaxReDriveLegs = 3;
+
         private static void Crumb(string message) => Debug.Log("[W4502] " + message);
 
         private readonly List<RunnerHostFixture> _fixtures =
@@ -165,31 +183,51 @@ namespace OpWeave.UnityAdapter.Tests
         // reload runs [SetUp] again before the iterator continues — here
         // that deleted ProbeDir and the phase-1 state file mid-test. The
         // cleanup lives in [UnitySetUp]/[UnityTearDown], the persisted
-        // outer command the runner executes exactly once per test for
-        // [Test] and [UnityTest] alike — the ResumeBranchingReloadTests
-        // structure.
+        // outer command — and UTF replays THOSE commands from their first
+        // statement on every domain a [UnityTest] crosses, so the probe
+        // nonce gates the setup: a replay around the in-flight test
+        // restores nothing and deletes nothing (the body it resumes into
+        // owns the probe state — the At03NoDuplicatesTests discipline).
+        // Neither command may yield an ExpectDomainReload instruction
+        // (RecompileScripts): UTF's PrepareForDomainReload records the
+        // CURRENT TestEnumerator's program counter — still a different
+        // test's method enumerator during setup and teardown — and the
+        // resume then applies that stale PC to the next test method's
+        // fresh enumerator, jumping it past phase-1 entirely when the
+        // captured enumerator was abandoned mid-state. The compile the
+        // cleanup's script deletions queue stays behind the runner's
+        // LockReloadAssemblies and drains at the next test body's own
+        // armed RecompileScripts yield, whose captured PC is the correct
+        // one (the ChangeSetDomainReloadTests precedent).
         [UnitySetUp]
         public IEnumerator UnitySetUp()
         {
-            NewUntitledScene();
-            if (CleanupArtifacts())
+            if (ProbeStateIsLive())
             {
-                yield return new RecompileScripts(false);
+                Crumb("setup replayed around the in-flight test — " +
+                    "the live probe state is left untouched");
+                yield break;
             }
+            NewUntitledScene();
+            var dirty = CleanupArtifacts();
+            Crumb("setup cleanup exit; assetsDirty=" + dirty);
             NewBaseScene();
+            yield break;
         }
 
         [UnityTearDown]
         public IEnumerator UnityTearDown()
         {
+            // The test is over — drop the live-state nonce so the cleanup
+            // below really does reclaim the probe root.
+            DisarmProbeNonce();
             DisposeAll();
             NewUntitledScene();
             PrefabContentsFixture.UnloadAllOpenedContents();
             ClearHandoffRecords();
-            if (CleanupArtifacts())
-            {
-                yield return new RecompileScripts(false);
-            }
+            var dirty = CleanupArtifacts();
+            Crumb("teardown cleanup exit; assetsDirty=" + dirty);
+            yield break;
         }
 
         private void DisposeAll()
@@ -259,8 +297,18 @@ namespace OpWeave.UnityAdapter.Tests
             }
         }
 
+        // The probe-state cleanup — safe inside UnitySetUp and
+        // UnityTearDown, which must never schedule a reload. A replayed
+        // command around a live test leaves the probe root untouched:
+        // only a ProbeDir whose nonce is not the armed one is stale
+        // residue, so the Run-lock reclaim and the deletes run only
+        // while no in-flight test owns the probe state.
         private static bool CleanupArtifacts()
         {
+            if (ProbeStateIsLive())
+            {
+                return false;
+            }
             ReleaseLeakedState();
             if (Directory.Exists(ProbeDir))
             {
@@ -545,15 +593,50 @@ namespace OpWeave.UnityAdapter.Tests
             WriteLines(storeRoot, runId, lines);
         }
 
+        // The session-token pair the nonce proves: the file under the
+        // probe root carries the nonce WriteState armed in SessionState,
+        // and both die together on any cleanup that legitimately reclaims
+        // the root — a file without the armed session's nonce is residue
+        // of an earlier Editor session, never this run's phase-1.
+        private static string ArmProbeNonce()
+        {
+            var nonce = Guid.NewGuid().ToString("N");
+            Directory.CreateDirectory(ProbeDir);
+            File.WriteAllText(NonceFile, nonce + "\n", s_utf8);
+            SessionState.SetString(ProbeSessionKey, nonce);
+            return nonce;
+        }
+
+        private static void DisarmProbeNonce() =>
+            SessionState.EraseString(ProbeSessionKey);
+
+        private static bool ProbeStateIsLive()
+        {
+            var nonce = SessionState.GetString(ProbeSessionKey, "");
+            return nonce.Length > 0 && File.Exists(NonceFile) &&
+                string.Equals(
+                    File.ReadAllText(NonceFile).Trim(), nonce,
+                    StringComparison.Ordinal);
+        }
+
+        // A phase-1 state write also arms the probe-state nonce: from
+        // here on the probe root is live in-flight state a replayed
+        // setup or cleanup must not reclaim.
         private static void WriteState(params string[] lines)
         {
             Directory.CreateDirectory(ProbeDir);
             File.WriteAllText(StateFile, string.Join("\n", lines) + "\n", s_utf8);
+            ArmProbeNonce();
         }
 
         private static string[] ReadState()
         {
             Assert.IsTrue(File.Exists(StateFile), "the phase-1 state file is missing");
+            Assert.IsTrue(
+                ProbeStateIsLive(),
+                "the phase-1 probe state is stale — the nonce on disk is " +
+                "not this Editor session's, so what phase-2 would read " +
+                "is residue, not the state this session's phase-1 wrote");
             return File.ReadAllLines(StateFile);
         }
 
@@ -1795,14 +1878,43 @@ namespace OpWeave.UnityAdapter.Tests
             Assert.That(before.Ok, Is.True,
                 "pre-reload phase failed: " + before.Failure);
 
-            yield return new RecompileScripts();
-            var guard = 0;
-            while (DomainSentinelAlive && guard++ < 10000)
+            // T-W2.4-07 stale-resume self-heal: a predecessor's captured
+            // UTF resume PC applies to this fresh enumerator and lands it
+            // at one of the two post-yield states inside this loop — with
+            // every local (leg included) reset to default. Both
+            // continuations drain, then MUST pass the this-session probe
+            // check: a probe phase-1 never wrote re-drives a real phase-1
+            // + compile + reload instead of skipping silently into
+            // phase-2. If the probe still cannot be produced after the
+            // bound, the loop exits and phase-2's nonce validation fails
+            // loudly (the ChangeSetDomainReloadTests pattern).
+            for (var leg = 0; leg <= MaxReDriveLegs; leg++)
             {
-                yield return null;
+                yield return new RecompileScripts();
+                var guard = 0;
+                while (DomainSentinelAlive && guard++ < 10000)
+                {
+                    yield return null;
+                }
+                Assert.IsFalse(DomainSentinelAlive,
+                    "the probe compile did not produce a domain reload");
+
+                if (ProbeStateIsLive() || leg == MaxReDriveLegs)
+                {
+                    break;
+                }
+                Crumb("stale-resume re-drive leg=" + (leg + 1));
+                // The marker file an abandoned leg left behind carries
+                // identical bytes, so deleting the probe assets
+                // guarantees the re-write queues a real compile rather
+                // than a no-op Refresh.
+                CleanupArtifacts();
+                var redrive = StartedOnlyGroupPhase();
+                Crumb("phase-1 re-drive leg=" + (leg + 1) + " ok=" + redrive.Ok +
+                    " failure=" + redrive.Failure);
+                Assert.That(redrive.Ok, Is.True,
+                    "re-driven pre-reload phase failed: " + redrive.Failure);
             }
-            Assert.IsFalse(DomainSentinelAlive,
-                "the probe compile did not produce a domain reload");
 
             var after = StartedOnlyGroupPhaseAfter();
             Crumb("phase-2 ok=" + after.Ok + " failure=" + after.Failure);
