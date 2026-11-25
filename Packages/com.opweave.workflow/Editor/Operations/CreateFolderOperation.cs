@@ -121,12 +121,16 @@ namespace OpWeave.Operations
         // CreateFolder's answer: the §J contract is OW-UNITY-005 whenever the
         // path is not free, and an Operation that reports success for a folder
         // it did not create would leave the Run's change record claiming a
-        // creation the project never got. The Editor's other two answers are
-        // checked too — an empty one, and a GUID naming a folder other than the
-        // requested one: when the name is taken the Editor silently creates
-        // "taken 1" instead, so the returned GUID is resolved back to its path
-        // and must match exactly; that renamed folder is not what was asked for,
-        // so it is deleted again instead of being left behind by a failure.
+        // creation the project never got. OnlyExistingAssets is required for
+        // the occupancy check: the plain overload still answers a just-deleted
+        // asset's remembered GUID for the rest of the session, which would
+        // report a freed path as a false collision (Issue #232). The Editor's
+        // other two answers are checked too — an empty one, and a GUID naming
+        // a folder other than the requested one: when the name is taken the
+        // Editor silently creates "taken 1" instead, so the returned GUID is
+        // resolved back to its path and must match exactly; that renamed
+        // folder is not what was asked for, so it is deleted again instead of
+        // being left behind by a failure.
         private static Diagnostic? CreateFolders(string path)
         {
             var segments = path.Split('/');
@@ -136,7 +140,8 @@ namespace OpWeave.Operations
                 var child = parent + "/" + segments[i];
                 if (!AssetDatabase.IsValidFolder(child))
                 {
-                    if (AssetDatabase.AssetPathToGUID(child).Length > 0)
+                    if (AssetDatabase.AssetPathToGUID(
+                            child, AssetPathToGUIDOptions.OnlyExistingAssets).Length > 0)
                     {
                         return NotCreated();
                     }

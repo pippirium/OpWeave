@@ -229,7 +229,11 @@ namespace OpWeave.Operations
             // NotApplied: the target is still an outermost instance of the
             // recorded Prefab with the identical structure and override
             // list — the step provably changed nothing and a rerun only
-            // unpacks.
+            // unpacks. Identical evidence is required, and unverifiable
+            // markers (a missing-script component, an unreadable or
+            // unsupported override member) never count as identical —
+            // evidence the session could not inspect proves nothing
+            // (fail closed, Issue #313).
             if (PrefabUtility.IsOutermostPrefabInstanceRoot(target))
             {
                 var livePath =
@@ -238,15 +242,24 @@ namespace OpWeave.Operations
                     ? string.Empty
                     : AssetDatabase.AssetPathToGUID(livePath);
                 if (string.Equals(livePath, prefabPath, StringComparison.Ordinal) &&
-                    string.Equals(liveGuid, prefabGuid, StringComparison.Ordinal) &&
-                    JToken.DeepEquals(
-                        overridesToken,
-                        PrefabInstanceEvidence.OverridesOf(target)) &&
-                    JToken.DeepEquals(
-                        structure,
-                        PrefabInstanceEvidence.StructureOf(target)))
+                    string.Equals(liveGuid, prefabGuid, StringComparison.Ordinal))
                 {
-                    return new ReconcileResult.NotApplied();
+                    var liveOverrides = PrefabInstanceEvidence.OverridesOf(target);
+                    var liveStructure = PrefabInstanceEvidence.StructureOf(target);
+                    if (!PrefabInstanceEvidence.OverridesVerifiable(overridesToken) ||
+                        !PrefabInstanceEvidence.OverridesVerifiable(liveOverrides) ||
+                        !PrefabInstanceEvidence.StructureVerifiable(structure) ||
+                        !PrefabInstanceEvidence.StructureVerifiable(liveStructure))
+                    {
+                        return Unknown(
+                            "The target is still a Prefab instance but its " +
+                            "evidence could not be inspected.");
+                    }
+                    if (JToken.DeepEquals(overridesToken, liveOverrides) &&
+                        JToken.DeepEquals(structure, liveStructure))
+                    {
+                        return new ReconcileResult.NotApplied();
+                    }
                 }
                 return Unknown(
                     "The target is still a Prefab instance but its source, " +
@@ -257,7 +270,15 @@ namespace OpWeave.Operations
             // mode's expected membership state — the target's members
             // freed and deeper instances untouched, or the whole hierarchy
             // freed under "completely". Any foreign change, partial unpack
-            // or misplaced object fails this check into Unknown.
+            // or misplaced object fails this check into Unknown. The
+            // snapshot's own override evidence must have been inspectable
+            // too: a recorded marker is partial evidence, and no verdict
+            // may rest on it (§F5 common rule 6, Issue #313).
+            if (!PrefabInstanceEvidence.OverridesVerifiable(overridesToken))
+            {
+                return Unknown(
+                    "The snapshot's override evidence could not be inspected.");
+            }
             if (!PrefabInstanceEvidence.StructuresMatch(
                     structure, target, completely, prefabPath, out var reason))
             {

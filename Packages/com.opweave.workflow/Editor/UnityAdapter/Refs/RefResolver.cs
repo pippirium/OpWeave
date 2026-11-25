@@ -299,33 +299,39 @@ namespace OpWeave.UnityAdapter
             if (handleClaimed)
             {
                 var viaHandle = SessionHandle.Resolve(claimedHandle);
-                if (viaHandle is GameObject viaHandleGo)
+                if (viaHandle != null)
                 {
-                    resolved = viaHandleGo;
-                }
-                else if (viaHandle is not null)
-                {
-                    return Fail<GameObject>(ErrorCodes.OW_UNITY_002,
-                        "The ref's handle names an object that is not a GameObject.",
-                        Member(jsonPath, "handle"));
+                    if (viaHandle is GameObject viaHandleGo)
+                    {
+                        resolved = viaHandleGo;
+                    }
+                    else
+                    {
+                        return Fail<GameObject>(ErrorCodes.OW_UNITY_002,
+                            "The ref's handle names an object that is not a GameObject.",
+                            Member(jsonPath, "handle"));
+                    }
                 }
             }
-            if (resolved is null && globalId is not null &&
+            if (resolved == null && globalId is not null &&
                 GlobalObjectId.TryParse(globalId, out var parsedId))
             {
                 var viaGlobal = GlobalObjectId.GlobalObjectIdentifierToObjectSlow(parsedId);
-                if (viaGlobal is GameObject viaGlobalGo)
+                if (viaGlobal != null)
                 {
-                    resolved = viaGlobalGo;
-                }
-                else if (viaGlobal is not null)
-                {
-                    return Fail<GameObject>(ErrorCodes.OW_UNITY_002,
-                        "The ref's globalId names an object that is not a GameObject.",
-                        Member(jsonPath, "globalId"));
+                    if (viaGlobal is GameObject viaGlobalGo)
+                    {
+                        resolved = viaGlobalGo;
+                    }
+                    else
+                    {
+                        return Fail<GameObject>(ErrorCodes.OW_UNITY_002,
+                            "The ref's globalId names an object that is not a GameObject.",
+                            Member(jsonPath, "globalId"));
+                    }
                 }
             }
-            if (resolved is null && path is not null)
+            if (resolved == null && path is not null)
             {
                 if (!RefHierarchyPath.TryParse(path, out var segments))
                 {
@@ -345,7 +351,7 @@ namespace OpWeave.UnityAdapter
                 }
                 resolved = walked.Value!;
             }
-            if (resolved is null)
+            if (resolved == null)
             {
                 return Fail<GameObject>(ErrorCodes.OW_UNITY_001,
                     "No key of the ref resolves to a live GameObject.", jsonPath);
@@ -442,7 +448,7 @@ namespace OpWeave.UnityAdapter
                 {
                     var guid = sceneName.Substring(PrefabContentsPrefix.Length);
                     var root = _prefabContentsRoots?.Invoke(guid);
-                    if (root is null)
+                    if (root == null)
                     {
                         return Fail<IReadOnlyList<GameObject>>(ErrorCodes.OW_UNITY_003,
                             "No open prefab contents resource matches the ref's scene.",
@@ -562,7 +568,7 @@ namespace OpWeave.UnityAdapter
                 {
                     var root = _prefabContentsRoots?.Invoke(
                         name.Substring(PrefabContentsPrefix.Length));
-                    if (root is null)
+                    if (root == null)
                     {
                         return ErrorCodes.Create(
                             ErrorCodes.OW_UNITY_003,
@@ -773,12 +779,19 @@ namespace OpWeave.UnityAdapter
                     $"No component of type '{typeName ?? "unity.Component"}' exists at index {index}.",
                     Member(jsonPath, "index"));
             }
-            if (components[index] is T typed)
+            var selected = components[index];
+            if (selected == null)
+            {
+                return Fail<T>(ErrorCodes.OW_UNITY_001,
+                    $"No component of type '{typeName ?? "unity.Component"}' exists at index {index}.",
+                    Member(jsonPath, "index"));
+            }
+            if (selected is T typed)
             {
                 return Result<T>.Success(typed);
             }
             return Fail<T>(ErrorCodes.OW_UNITY_002,
-                $"The resolved component of type '{components[index].GetType().Name}' " +
+                $"The resolved component of type '{selected.GetType().Name}' " +
                 $"is not a {typeof(T).Name}.", jsonPath);
         }
 
@@ -849,7 +862,7 @@ namespace OpWeave.UnityAdapter
                         break;
                     }
                 }
-                if (resolved is null)
+                if (resolved == null)
                 {
                     return Fail<T>(ErrorCodes.OW_UNITY_001,
                         $"No asset with localId {localId.Value} exists at '{target}'.",
@@ -864,9 +877,10 @@ namespace OpWeave.UnityAdapter
                 // (OW-UNITY-001) from assets of only other types
                 // (OW-UNITY-002).
                 resolved = AssetDatabase.LoadAssetAtPath<T>(target);
-                if (resolved is null)
+                if (resolved == null)
                 {
-                    return AssetDatabase.LoadMainAssetAtPath(target) is { } main
+                    var main = AssetDatabase.LoadMainAssetAtPath(target);
+                    return main != null
                         ? Fail<T>(ErrorCodes.OW_UNITY_002,
                             $"The assets at '{target}' hold no {typeof(T).Name}; " +
                             $"the main asset is a {main.GetType().Name}.",
@@ -929,7 +943,7 @@ namespace OpWeave.UnityAdapter
         private static JsonValue GameObjectRefOf(UnityEngine.Object obj, bool prefabInstance)
         {
             var go = obj as GameObject;
-            if (go is null)
+            if (go == null)
             {
                 throw new ArgumentException(
                     "The object is not a GameObject.", nameof(obj));
@@ -986,7 +1000,7 @@ namespace OpWeave.UnityAdapter
         private static JsonValue ComponentRefOf(UnityEngine.Object obj, string? typeArg)
         {
             var component = obj as Component;
-            if (component is null)
+            if (component == null)
             {
                 throw new ArgumentException(
                     "The object is not a Component.", nameof(obj));

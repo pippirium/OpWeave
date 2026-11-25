@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md)
 
-OpWeave is a Unity Editor workflow engine: it discovers typed operations, lets you compose them into workflow documents, compiles and executes them, and recovers interrupted runs from durable journals. It ships as the UPM package `com.opweave.workflow` version **0.1.1**, licensed under [Apache License 2.0](LICENSE).
+OpWeave is a Unity Editor workflow engine: it discovers typed operations, lets you compose them into workflow documents, compiles and executes them, and recovers interrupted runs from durable journals. It ships as the UPM package `com.opweave.workflow` version **0.1.2**, licensed under [Apache License 2.0](LICENSE).
 
 ## Windows v1 capabilities
 
@@ -22,6 +22,7 @@ OpWeave is a Unity Editor workflow engine: it discovers typed operations, lets y
 - **Verified Unity Editor:** 6000.5.11f1
 - **Package manifest floor:** Unity `6000.0`
 - **Graph Toolkit authoring UI:** Unity 6000.5 or newer; the verified configuration is 6000.5.11f1
+- **Compatibility verification:** Unity 6000.0.85f1 covers the non-Graph-Toolkit package surface only
 - macOS and Linux are **not supported in v1** (see Known limitations).
 
 The manifest floor is a compile floor, not the verified support target. Do not treat Graph Toolkit GUI functionality as supported on Unity 6000.0.
@@ -35,7 +36,7 @@ Add the package through a Git URL pinned to the release tag:
 3. Enter:
 
    ```
-   https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.1
+   https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.2
    ```
 
 The package declares its dependencies (`com.unity.nuget.newtonsoft-json`, `com.unity.nuget.mono-cecil`) so they resolve automatically from the Unity registry.
@@ -44,9 +45,10 @@ The package declares its dependencies (`com.unity.nuget.newtonsoft-json`, `com.u
 
 To upgrade, change the tag in the Git URL and reinstall or update the package. Release tags are immutable; fixes ship as later versions rather than by moving an existing tag.
 
-The previous release remains available at:
+Older releases remain available at:
 
 ```
+https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.1
 https://github.com/pippirium/OpWeave.git?path=Packages/com.opweave.workflow#v0.1.0
 ```
 
@@ -106,6 +108,21 @@ An operation implementation normally derives from `OperationBase`, declares its 
 | `Schemas~`, `Samples~`, `Editor/Templates~` | JSON schemas, sample workflows, templates (Unity-ignored folders) |
 | `Tests` | Package test assemblies and vendored test-only plugin binaries |
 
+## What changed in 0.1.2
+
+Version 0.1.2 is a backwards-compatible patch release:
+
+- Made canonical `.opweave.json` save locking safer across overlapping project roots by keying exclusion to the canonical resolved target path.
+- Added bounded automatic retry for transient settings-write holds such as short-lived indexer or virus-scanner locks; persistent or externally changed content still fails closed.
+- Corrected handling of destroyed Unity objects so fake-null references are treated as absent rather than live.
+- Corrected folder creation after deletion of an asset at the same path; stale deleted-asset GUIDs no longer cause false collisions.
+- Made prefab-unpack reconciliation safer by requiring verifiable recorded and live evidence before proving a step already applied or complete.
+- Added explicit `OW-UNITY-002` diagnostics for malformed graph-carrier JSON instead of silently dropping undecodable carrier content.
+- Improved Graph/JSON synchronization test isolation. This is internal test-infrastructure quality work, not a new public feature.
+- Verified non-Graph-Toolkit package compatibility on Unity 6000.0.85f1. Graph Toolkit authoring remains Unity 6000.5+ only.
+
+No existing public API, operation/type ID, plan hash, journal format, workflow format, or settings format intentionally changed in 0.1.2. Upgrading from 0.1.1 requires no migration. Users may notice `.opweave-locks` directories beside `.opweave.json` targets; they are intentional lock artifacts ignored by Unity import.
+
 ## What changed in 0.1.1
 
 Version 0.1.1 is a backwards-compatible patch release:
@@ -122,7 +139,8 @@ No existing public API, operation/type ID, plan hash, journal format, or setting
 
 | Version | Status | Notes |
 | --- | --- | --- |
-| 0.1.1 | Current public release | Project Browser graph creation, runner lock handoff fix, preflight pending-input fixes, stability and acceptance improvements |
+| 0.1.2 | Current public release | Safer JSON save locking, settings-write retry, destroyed-object and deleted-asset corrections, prefab-unpack evidence safety, malformed graph-carrier diagnostics, Unity 6000.0 compatibility verification |
+| 0.1.1 | Previous public release | Project Browser graph creation, runner lock handoff fix, preflight pending-input fixes, stability and acceptance improvements |
 | 0.1.0 | Previous public release | Initial Windows v1 public package transfer |
 
 ## License
@@ -139,4 +157,4 @@ OpWeave-authored code and documentation are licensed under the [Apache License, 
 
 ## Provenance
 
-Version `0.1.1` corresponds to the accepted Windows v1 development revision recorded in [VERSION](VERSION) and [release-lock.json](release-lock.json) (source: private `pippirium/OpWeave-dev`; G-09 acceptance evidence referenced there). `0.1.1` identifies one immutable product payload; corrections ship under a later version, never a retargeted tag.
+Version `0.1.2` corresponds to the accepted Windows v1 development revision recorded in [VERSION](VERSION) and [release-lock.json](release-lock.json) (source: private `pippirium/OpWeave-dev`; Stage A-D acceptance evidence referenced there). `0.1.2` identifies one immutable product payload; corrections ship under a later version, never a retargeted tag.

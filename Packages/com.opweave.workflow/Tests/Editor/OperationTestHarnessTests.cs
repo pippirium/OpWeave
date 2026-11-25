@@ -6,6 +6,10 @@
 // same Operation), RunInterrupted stopping at BeforeExecute/AfterExecute with
 // the journaled state the Runner's fold would read there, and Dispose leaving
 // no temporary scene, folder or asset behind.
+//
+// T-W2.7-06 [Edit] regression: local:T-W2.7-06:create-folder-deleted-guid —
+// Issue #232, a folder at a deleted asset's former path must create while a
+// live asset still refuses OW-UNITY-005.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -334,59 +338,96 @@ namespace OpWeave.UnityAdapter.Tests
             Assert.AreEqual(1, result.Journal.Count);
             Assert.AreEqual(JournalRecordType.StepStarted, result.Journal[0].Type);
 
-            // The write-ahead record is the same one a full Run writes, but
-            // proving it cannot rerun the same path: that needs the folder
-            // the interrupted Execute created deleted first, and
-            // CreateFolderOperation's occupancy check — merged before this
-            // ticket, Issue #232 — reads AssetDatabase.AssetPathToGUID,
-            // which still answers a just-deleted folder's GUID in the same
-            // session, so the free path is reported as an OW-UNITY-005
-            // collision. The comparison Run therefore goes to a sibling path
-            // the session has never used, which makes the two step_started
-            // records differ in exactly the members the path input feeds:
-            // `snapshot` is the Preflight's {"path": <normalized input>} and
-            // `inputsDigest` is the CanonicalJson.Sha256 of the present
-            // inputs {"path": <as written>} — for this Operation every
-            // member is path-derived, so member-for-member reduces to the
-            // record's member set, and each member is then proven equal
-            // under the path substitution.
-            var fullPath = harness.TempFolder + "/CreatedCheck";
-            var full = harness.Run(CreateFolderId, new { path = fullPath });
+            // The write-ahead record is the same one a full Run writes.
+            // Proving it needs the folder the interrupted Execute created
+            // deleted first, so the full Run starts from the free path the
+            // interrupted one saw; the occupancy check now asks only about
+            // existing assets, so the session's remembered GUID no longer
+            // reports the freed path as an OW-UNITY-005 collision (Issue
+            // #232 — the same-path rerun this relies on used to need a
+            // sibling path instead).
+            Assert.That(AssetDatabase.DeleteAsset(path), Is.True,
+                "the interrupted run's folder must go before the path is reused");
+            Assert.That(AssetDatabase.AssetPathToGUID(path), Is.Not.Empty,
+                "the session must still remember the deleted folder's GUID — " +
+                "the Issue #232 state the same-path rerun exercises");
+            Assert.That(
+                AssetDatabase.AssetPathToGUID(
+                    path, AssetPathToGUIDOptions.OnlyExistingAssets),
+                Is.Empty,
+                "no existing asset holds the freed path");
+
+            var full = harness.Run(CreateFolderId, new { path });
             Assert.That(full.Ok, Is.True, () => full.ToString());
             Assert.AreEqual(JournalRecordType.StepStarted, full.Journal[0].Type);
 
-            var interrupted = (JObject)result.Journal[0].Data.ToToken();
-            var fullStarted = (JObject)full.Journal[0].Data.ToToken();
-            Assert.That(
-                fullStarted.Properties().Select(property => property.Name),
-                Is.EquivalentTo(
-                    interrupted.Properties().Select(property => property.Name)),
-                "the write-ahead record must carry the members a full run's does");
-
-            // `snapshot`: the Preflight stores the input's normalized path —
-            // the test paths are already normalized, so the stored value
-            // equals the input verbatim. Substituting the interrupted run's
-            // value must reproduce its snapshot member-for-member: nothing
-            // else in the snapshot varies with the path.
-            Assert.AreEqual(path, interrupted["snapshot"]!["path"]!.ToString());
-            var snapshot = (JObject)fullStarted["snapshot"]!.DeepClone();
-            Assert.AreEqual(fullPath, snapshot["path"]!.ToString());
-            snapshot["path"] = interrupted["snapshot"]!["path"]!.DeepClone();
+            // Same inputs, same synthetic step identity, so the records are
+            // equal member for member — `snapshot` is the Preflight's
+            // {"path": <normalized input>} and `inputsDigest` is the
+            // CanonicalJson.Sha256 of the present inputs {"path": <as
+            // written>}; nothing else in the record varies between the runs.
             Assert.IsTrue(
-                JToken.DeepEquals(interrupted["snapshot"], snapshot),
-                "interrupted snapshot must equal a normal run's modulo the path");
+                JToken.DeepEquals(
+                    result.Journal[0].Data.ToToken(),
+                    full.Journal[0].Data.ToToken()),
+                "the write-ahead record must equal a normal run's for the same inputs");
+        }
 
-            // `inputsDigest`: recomputing CanonicalJson.Sha256 over
-            // {path: <input as written>} must reproduce each record's member
-            // — the two digests differ only because their path inputs did.
+        // ── local:T-W2.7-06:create-folder-deleted-guid (Issue #232) ─────────
+
+        // Issue #232: create_folder's occupancy check asked the asset
+        // database who holds the path, and the default AssetPathToGUID still
+        // answers a deleted asset's remembered GUID for the rest of the
+        // session — a false OW-UNITY-005 collision. OnlyExistingAssets frees
+        // the deleted asset's path while a live asset still refuses.
+        [Test]
+        public void CreateFolderAtADeletedAssetsPathSucceedsWhileALiveAssetStillRefuses()
+        {
+            var harness = Track(OperationTestHarness.Create());
+            var freed = harness.TempFolder + "/Freed";
+            var taken = harness.TempFolder + "/taken";
+
+            Assert.That(
+                AssetDatabase.CreateFolder(harness.TempFolder, "Freed"),
+                Is.Not.Empty,
+                "the folder to delete must be created");
+            Assert.That(AssetDatabase.DeleteAsset(freed), Is.True,
+                "the folder must be deleted before its path is reused");
+            Assert.That(AssetDatabase.IsValidFolder(freed), Is.False);
+            Assert.That(AssetDatabase.AssetPathToGUID(freed), Is.Not.Empty,
+                "the session must still remember the deleted folder's GUID — " +
+                "that remembered answer is the Issue #232 state");
+            Assert.That(
+                AssetDatabase.AssetPathToGUID(
+                    freed, AssetPathToGUIDOptions.OnlyExistingAssets),
+                Is.Empty,
+                "no existing asset holds the freed path");
+
+            var created = harness.Run(CreateFolderId, new { path = freed });
+
+            Assert.That(created.Ok, Is.True, () => created.ToString());
+            Assert.That(AssetDatabase.IsValidFolder(freed), Is.True);
             Assert.AreEqual(
-                CanonicalJson.Sha256(new JObject { ["path"] = path }),
-                interrupted["inputsDigest"]!.ToString(),
-                "interrupted inputsDigest must hash the interrupted run's inputs");
-            Assert.AreEqual(
-                CanonicalJson.Sha256(new JObject { ["path"] = fullPath }),
-                fullStarted["inputsDigest"]!.ToString(),
-                "full-run inputsDigest must hash the full run's inputs");
+                "\"" + freed + "\"", created.Outputs["path"].CanonicalText);
+
+            // The unchanged half of the contract: a live asset at the path —
+            // an extensionless file the Editor holds as a DefaultAsset at
+            // exactly the folder path — still refuses with §J's OW-UNITY-005.
+            File.WriteAllText(
+                Path.Combine(
+                    RunnerHostFixture.ProjectRoot,
+                    taken.Replace('/', Path.DirectorySeparatorChar)),
+                string.Empty);
+            AssetDatabase.ImportAsset(taken, ImportAssetOptions.ForceSynchronousImport);
+            Assert.That(AssetDatabase.AssetPathToGUID(taken), Is.Not.Empty,
+                "the live asset must occupy the path");
+
+            var refused = harness.Run(CreateFolderId, new { path = taken });
+
+            Assert.AreEqual(StepState.Failed, refused.StepState);
+            Assert.AreEqual(ErrorCodes.OW_UNITY_005, refused.Diagnostics[0].Code);
+            Assert.That(AssetDatabase.IsValidFolder(taken), Is.False,
+                "a refused create must leave no folder behind");
         }
 
         // ── local:T-W2.10-01:test-harness — no residue after Dispose ─────────

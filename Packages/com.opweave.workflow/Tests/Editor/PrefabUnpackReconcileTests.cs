@@ -413,6 +413,233 @@ namespace OpWeave.UnityAdapter.Tests
                 Is.True, "the foreign override is left in place");
         }
 
+        // ══ T-W2.6-08: unverifiable evidence markers prove nothing ══════
+        //
+        // Issue #313: StructuresMatch/OverridesOf compared unverifiable
+        // markers ({"type":"<missing>"}, "<unreadable:…>",
+        // "<unsupported:…>") by JToken.DeepEquals, so two identical
+        // markers — evidence the session never inspected — counted as
+        // equal and Reconcile could answer a proven verdict on them.
+        // Post-fix both marker paths fail closed into Unknown.
+
+        private const string MissingScriptPath =
+            "Assets/OpWeavePrefabContentsProbe/MissingScript.prefab";
+
+        // A probe Prefab whose root carries a Transform plus a
+        // MonoBehaviour bound to a script guid that exists nowhere: Unity
+        // keeps the slot as a missing script — the real-world shape
+        // behind the "<missing>" component marker (the
+        // PrefabContentFingerprintTests.MissingScript_IsUnknown fixture).
+        private void CreateMissingScriptPrefab()
+        {
+            var yaml =
+                "%YAML 1.1\n" +
+                "%TAG !u! tag:unity3d.com,2011:\n" +
+                "--- !u!1 &100\n" +
+                "GameObject:\n" +
+                "  m_ObjectHideFlags: 0\n" +
+                "  m_CorrespondingSourceObject: {fileID: 0}\n" +
+                "  m_PrefabInstance: {fileID: 0}\n" +
+                "  m_PrefabAsset: {fileID: 0}\n" +
+                "  serializedVersion: 6\n" +
+                "  m_Component:\n" +
+                "  - component: {fileID: 400}\n" +
+                "  - component: {fileID: 114}\n" +
+                "  m_Layer: 0\n" +
+                "  m_Name: MissingRoot\n" +
+                "  m_TagString: Untagged\n" +
+                "  m_Icon: {fileID: 0}\n" +
+                "  m_NavMeshLayer: 0\n" +
+                "  m_StaticEditorFlags: 0\n" +
+                "  m_IsActive: 1\n" +
+                "--- !u!4 &400\n" +
+                "Transform:\n" +
+                "  m_ObjectHideFlags: 0\n" +
+                "  m_CorrespondingSourceObject: {fileID: 0}\n" +
+                "  m_PrefabInstance: {fileID: 0}\n" +
+                "  m_PrefabAsset: {fileID: 0}\n" +
+                "  m_GameObject: {fileID: 100}\n" +
+                "  serializedVersion: 2\n" +
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n" +
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n" +
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n" +
+                "  m_ConstrainProportionsScale: 0\n" +
+                "  m_Children: []\n" +
+                "  m_Father: {fileID: 0}\n" +
+                "  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}\n" +
+                "--- !u!114 &114\n" +
+                "MonoBehaviour:\n" +
+                "  m_ObjectHideFlags: 0\n" +
+                "  m_CorrespondingSourceObject: {fileID: 0}\n" +
+                "  m_PrefabInstance: {fileID: 0}\n" +
+                "  m_PrefabAsset: {fileID: 0}\n" +
+                "  m_GameObject: {fileID: 100}\n" +
+                "  m_Enabled: 1\n" +
+                "  m_EditorHideFlags: 0\n" +
+                "  m_Script: {fileID: 11500000, guid: 0000000000000000000000000000fffe, type: 3}\n" +
+                "  m_Name: \n" +
+                "  m_EditorClassIdentifier: \n";
+            File.WriteAllText(
+                Path.Combine(
+                    PrefabContentsFixture.ProjectRoot,
+                    MissingScriptPath.Replace('/', Path.DirectorySeparatorChar)),
+                yaml);
+            AssetDatabase.ImportAsset(
+                MissingScriptPath, ImportAssetOptions.ForceSynchronousImport);
+            Assert.IsNotNull(
+                AssetDatabase.LoadAssetAtPath<GameObject>(MissingScriptPath),
+                "the missing-script probe Prefab must import");
+        }
+
+        // The fixture check that proves a snapshot really carries a
+        // "<missing>" component marker — the tests below only fail
+        // closed when the evidence contains the marker they target.
+        private static bool HasMissingMarker(JsonValue snapshot)
+        {
+            var structure = (JArray)((JObject)snapshot.ToToken())["structure"]!;
+            foreach (var entry in structure)
+            {
+                var components = (JArray)((JObject)entry)["components"]!;
+                foreach (var component in components)
+                {
+                    if ((string?)((JObject)component)["type"] ==
+                        ComponentEvidence.MissingComponentMarker)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static JsonValue DamagedOverrides(JsonValue snapshot, JToken overrides)
+        {
+            var damaged = (JObject)snapshot.ToToken().DeepClone();
+            damaged["overrides"] = overrides;
+            return JsonValue.From(damaged);
+        }
+
+        // The components path, before-Execute verdict: the still-linked
+        // instance's identical "<missing>" markers on both sides must
+        // never prove the structure unchanged. Pre-fix DeepEquals called
+        // the markers equal and Reconcile answered NotApplied on a
+        // component the evidence never inspected.
+        [Test]
+        public void Unpack_MissingScriptMarker_StillInstance_ReturnsUnknown()
+        {
+            CreateMissingScriptPrefab();
+            var instance = Instantiate(MissingScriptPath);
+            var op = new PrefabUnpackOperation();
+            var snapshot = op.Preflight(Context(InstanceInputs(instance))).Snapshot;
+            Assert.That(HasMissingMarker(snapshot), Is.True,
+                "the fixture must record the \"<missing>\" component marker");
+
+            var verdict = op.Reconcile(Context(InstanceInputs(instance)), snapshot);
+
+            AssertUnknown(verdict, "inspect");
+            Assert.That(
+                ComponentEvidence.IsVerifiableEntry(
+                    new JObject { ["type"] = "<missing>" }),
+                Is.False,
+                "a marker entry can never be verifiable evidence");
+        }
+
+        // The components path, after-Execute verdict: the same identical
+        // markers must never prove the unpack either — pre-fix the
+        // verdict was Completed on a component never inspected.
+        [Test]
+        public void Unpack_MissingScriptMarker_AfterUnpack_ReturnsUnknown()
+        {
+            CreateMissingScriptPrefab();
+            var instance = Instantiate(MissingScriptPath);
+            var op = new PrefabUnpackOperation();
+            var snapshot = op.Preflight(Context(InstanceInputs(instance))).Snapshot;
+            Assert.That(HasMissingMarker(snapshot), Is.True,
+                "the fixture must record the \"<missing>\" component marker");
+            Assert.That(op.Execute(Context(InstanceInputs(instance))).Kind,
+                Is.EqualTo(StepResultKind.Succeeded));
+
+            var verdict = op.Reconcile(Context(LiveInputs(instance)), snapshot);
+
+            AssertUnknown(verdict, "inspect");
+        }
+
+        // The overrides path, before-Execute verdict: a snapshot whose
+        // override list is the "<unreadable:…>" marker proves nothing
+        // about the still-linked instance — never NotApplied.
+        [Test]
+        public void Unpack_UnreadableOverridesMarker_StillInstance_ReturnsUnknown()
+        {
+            CreateContainerPrefab();
+            var instance = Instantiate(ContainerPath);
+            var op = new PrefabUnpackOperation();
+            var snapshot = op.Preflight(Context(InstanceInputs(instance))).Snapshot;
+            var damaged = DamagedOverrides(
+                snapshot,
+                JValue.CreateString("<unreadable: no m_Modification>"));
+
+            var verdict = op.Reconcile(Context(InstanceInputs(instance)), damaged);
+
+            AssertUnknown(verdict, "inspect");
+            Assert.That(
+                PrefabInstanceEvidence.OverridesVerifiable(
+                    JValue.CreateString("<unreadable: no m_Modification>")),
+                Is.False,
+                "an unreadable-marker list can never equal another marker");
+        }
+
+        // The overrides path, after-Execute verdict: the recorded
+        // "<unreadable:…>" marker must block Completed too — §F5's
+        // evidence row is incomplete, and no verdict may rest on partial
+        // evidence (Issue #313). Pre-fix the overrides member was ignored
+        // on this path and the verdict was Completed.
+        [Test]
+        public void Unpack_UnreadableOverridesMarker_AfterUnpack_ReturnsUnknown()
+        {
+            CreateContainerPrefab();
+            var instance = Instantiate(ContainerPath);
+            var op = new PrefabUnpackOperation();
+            var snapshot = op.Preflight(Context(InstanceInputs(instance))).Snapshot;
+            var damaged = DamagedOverrides(
+                snapshot,
+                JValue.CreateString("<unreadable: no m_Modification>"));
+            Assert.That(op.Execute(Context(InstanceInputs(instance))).Kind,
+                Is.EqualTo(StepResultKind.Succeeded));
+
+            var verdict = op.Reconcile(Context(LiveInputs(instance)), damaged);
+
+            AssertUnknown(verdict, "inspect");
+        }
+
+        // The same marker rule inside the override list: a member whose
+        // normalized data is the "<unsupported:…>" marker is
+        // unverifiable evidence, and identical markers still prove
+        // nothing.
+        [Test]
+        public void Unpack_UnsupportedOverrideMember_AfterUnpack_ReturnsUnknown()
+        {
+            CreateContainerPrefab();
+            var instance = Instantiate(ContainerPath);
+            var op = new PrefabUnpackOperation();
+            var snapshot = op.Preflight(Context(InstanceInputs(instance))).Snapshot;
+            var damaged = DamagedOverrides(
+                snapshot,
+                new JArray
+                {
+                    new JObject
+                    {
+                        ["member"] = "m_Modifications",
+                        ["data"] = JValue.CreateString("<unsupported:ManagedReference>"),
+                    },
+                });
+            Assert.That(op.Execute(Context(InstanceInputs(instance))).Kind,
+                Is.EqualTo(StepResultKind.Succeeded));
+
+            var verdict = op.Reconcile(Context(LiveInputs(instance)), damaged);
+
+            AssertUnknown(verdict, "inspect");
+        }
+
         // ══ [UnityTest] real domain reload (SPEC §T.3) ═══════════════════
 
         private static object? s_sentinel;
